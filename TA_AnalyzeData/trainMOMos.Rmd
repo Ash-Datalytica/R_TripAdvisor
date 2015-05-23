@@ -1,0 +1,348 @@
+---
+title: "Выбор модели для классификации пользователей TripAdvisor"
+author: "Alexey Shovkun"
+date: "Tuesday, April 18, 2015"
+output: html_document
+---
+
+## Разведка исходных даных 
+
+```{r init, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+#eval(parse('C:/Work/R_Sentiment/textFunctions.R',encoding = "UTF-8"))
+
+require (ggplot2); 
+#require(gridExtra)
+#require (PerformanceAnalytics)  #chart.Correlation()
+library(AppliedPredictiveModeling)
+transparentTheme(trans = .4)
+require (stringi)
+require (dplyr)
+#require(tidyr) #unnest
+require(reshape2) #melt
+require(caret) #dummyVars, featurePlot
+trellis.par.set(caretTheme())
+require(doSNOW)
+require(rattle) #fancyRpartPlot
+
+#dfMOMosNormalized <- readRDS("data/MaldivesMOMosNormalized.rds") #memberTitle фактор, 
+#лучшая точность (logReg) = 60%
+
+dfMOMosNormalized <- readRDS("data/MaldivesMOMosNormalized_v2.rds") #memberTitle = число [0,1]
+#лучшая точность (logReg) = 68%!
+
+cl<-makeCluster(4) # Assign number of cores to use
+registerDoSNOW(cl) # Register the cores.
+
+```
+
+Выделяем обучающую и тестовую выборки. Проверку качества модели в процессе подбора её параметров будем делать с использованием метода перекрестной проверки (cross validation) на обучающей выборке. Тестовая выборка будет использована **только** для оценки качества результирующей модели.
+
+```{r makeSets, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
+set.seed(20150415)
+#только классифицированные пользователи
+dfTrain <- dfMOMosNormalized[!is.na(dfMOMosNormalized$class),]
+inTrain <- createDataPartition(dfTrain$class, p = .7,
+                                  list = FALSE,
+                                  times = 1)
+dfTest <- dfTrain[-inTrain,]
+dfTrain <- dfTrain[inTrain,]
+
+```
+
+Размеры выборок: 
+
+- обучающая: `r nrow(dfTrain)` экземпляров.
+
+- проверочная: отсутствует.
+
+- тестовая: `r nrow(dfTest)` экземпляров.
+
+
+
+## Малоинформативные параметры
+
+Проанализируем, какие параметры не несут информации (вариация равна 0, все значения одинаковы) или почти не несут информации (вариация близка к 0, большинство значений параметра одинаковы).
+
+```{r zeroVariance, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
+nzv <- nearZeroVar(dfTrain, saveMetrics= TRUE)
+#nzv[nzv$nzv,] # вариация около 0. При перекрестной проверке могут получиться выборки с нулевой вариацией.
+nzv[nzv$zeroVar,]
+
+```
+
+Перечисленные выше параметры не могут быть использованы для обучения модели. При сборе большего количества обучающих примеров, следует рассмотреть пользователей, у которых эти параметры не равны 0.
+
+
+## Обучение модели
+
+### Форсированная логистическая регрессия (Boosted Logistic Regression)
+
+```{r trainLogisticRegression, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
+#View (dfTrain)
+set.seed(20150417)
+modLogReg <- train (class ~ ., method="LogitBoost", 
+                data = dfTrain [, -c(1, which(nzv$nzv))],
+                trControl = trainControl(method = "cv", number=10, repeats=10),
+                tuneGrid = data.frame(
+                    nIter = c(20,30,40,45,50, 53, 55, 57, 60, 65, 70, 90,100,110,150,180,200,250,300,400,500)
+                    )
+                #tuneLength=20
+                )
+modLogReg
+#modLogReg$finalModel
+paramLogReg <- modLogReg$finalModel$tuneValue$nIter
+ggplot(modLogReg)
+```
+
+
+### Дерево решений (Decision Tree)
+
+```{r trainTree, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
+
+#View (dfTrain)
+set.seed(12345)
+modDT <- train (class ~ ., method="rpart", 
+                data = dfTrain [, -c(1)],
+                trControl = trainControl(method = "cv", number=10, repeats=10),
+                tuneLength=20)
+modDT
+print(modDT$finalModel)
+#ggplot(modDT)
+fancyRpartPlot(modDT$finalModel)
+
+# set.seed(20150417)
+# #debugonce("rpart")
+# library(plyr); library(dplyr)
+# modDT2 <- train (class ~ ., method="C5.0", 
+#                 data = dfTrain [, -c(1, which(nzv$nzv))],
+#                 trControl = trainControl(method = "cv", number=10, repeats=10))
+# print(modDT2$finalModel)
+# warnings()
+# fancyRpartPlot(modDT2$finalModel)
+
+```
+
+### Случайный лес (Random Forest)
+
+```{r trainRandomForest, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
+#View (dfTrain)
+nPredictors = ncol(dfTrain)-1
+set.seed(1234)
+modRF <- train (class ~ ., method="rf", 
+                data = dfTrain [, !(colnames(dfTrain) %in% c("uid"))],
+                trControl = trainControl(method = "cv", number=10, repeats=10),
+                tuneGrid = data.frame(mtry=c(
+                    ceiling(sqrt(nPredictors))/3,
+                    ceiling(sqrt(nPredictors))/2,
+                    ceiling(sqrt(nPredictors)),
+                    ceiling(sqrt(nPredictors))*2
+                    , ceiling(nPredictors/3)
+                    , ceiling(nPredictors/2)
+                    , ceiling(nPredictors*2/3)
+                    , nPredictors
+                ))
+                #tuneLength=40
+                )
+modRF
+ggplot(modRF)
+#modRF$finalModel
+```
+
+### Метод опорных векторов (Support Vector Machine)
+
+```{r trainSVM, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
+set.seed(1234)
+modSVM <- train (class ~ ., method="svmLinear", 
+                data = dfTrain [, -c(1, which(nzv$nzv))],
+                trControl = trainControl(method = "cv", number=10, repeats=10),
+                tuneGrid = data.frame( C=c(0.03,0.1,0.3, 0.5,0.6, 0.7, 0.8, 0.9, 1, 1.1, 1.5, 3,10, 15)
+                     ))
+modSVM
+#modSVM$finalModel
+paramSVM <- modSVM$finalModel@param$C # chosen C parameter
+#warnings()
+#assign("last.warning", NULL, envir = baseenv()) # очистить список варнингов
+
+ggplot (modSVM)
+```
+
+### Логистическая регрессия (Generalized Linear Model)
+
+```{r trainGLM, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
+
+#View (dfTrain)
+set.seed(20150417)
+modGLM <- train (class ~ ., method="glm", 
+                data = dfTrain [, -c(1, which(nzv$nzv))],
+                trControl = trainControl(method = "cv", number=10, repeats=10),
+#                 tuneGrid = data.frame(
+#                     nIter = c(20,30,40,45,50, 53, 55, 57, 60, 65, 70, 90,100,110,150,180,200,250,300,400,500)
+#                     )
+                tuneLength=20
+                )
+modGLM
+#modGLM$finalModel
+```
+
+### Boosted Generalized Linear Model
+
+```{r trainGLMBoost, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
+#View (dfTrain)
+set.seed(20150417)
+modGLMBoost <- train (class ~ ., method="glmboost", 
+                data = dfTrain [, -c(1, which(nzv$nzv))],
+                trControl = trainControl(method = "cv", number=10, repeats=10),
+#                 tuneGrid = data.frame(
+#                     nIter = c(20,30,40,45,50, 53, 55, 57, 60, 65, 70, 90,100,110,150,180,200,250,300,400,500)
+#                     )
+                tuneLength=20
+                )
+modGLMBoost
+#modGLMBoost$finalModel
+ggplot(modGLMBoost)
+```
+
+### Generalized Linear Model with Stepwise Feature Selection
+
+```{r trainGLMStepAIC, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
+# #View (dfTrain)
+# set.seed(20150417)
+# modGLMStepAIC <- train (class ~ ., method="glmStepAIC", 
+#                 data = dfTrain [, -c(1, which(nzv$nzv))],
+#                 trControl = trainControl(method = "cv", number=10, repeats=10),
+# #                 tuneGrid = data.frame(
+# #                     nIter = c(20,30,40,45,50, 53, 55, 57, 60, 65, 70, 90,100,110,150,180,200,250,300,400,500)
+# #                     )
+#                 tuneLength=3
+#                 )
+# modGLMStepAIC
+# #modGLMStepAIC$finalModel
+# ggplot(modGLMStepAIC)
+```
+
+Работает очень медленно. За 20 минут нет результата.
+
+### Анализ качества обученных моделей
+
+Все методы дают слабые результаты (точность ~60-70%), но логистическая регрессия и SVM дают лучшие. 
+Проведем анализ сдвига/разброса на основе модели SVM c параметром С=`r paramSVM`.
+
+```{r biasAndVarianceSVM, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
+set.seed(1234)
+res <- data.frame()
+for  (m in 15:nrow(dfTrain)) {
+    mod <- train (class ~ ., method="svmLinear", 
+                    data = dfTrain [1:m, -c(1, which(nzv$nzv))],
+                    trControl = trainControl(method = "cv", number=10, repeats=10),
+                    tuneGrid = data.frame( C=paramSVM))
+    accTrain <- confusionMatrix(mod$finalModel@fitted, dfTrain$class[1:m], positive="1")$overall[1]
+    predictions <- predict (mod, newdata = dfTest)
+    accTest <- confusionMatrix(predictions,dfTest$class, positive="1")$overall[1]
+    res <- rbind(res, data.frame(m=m, errorTrain = 1-accTrain, errorTest = 1-accTest))
+}
+
+ggplot(aes (x=m, y=value, colour=variable, shape=variable), data = melt (res, id="m")) + 
+    geom_line(size=1) + geom_point(size=5) +
+    xlab("Размер обучающей выборки (m)") + 
+    ylab ("Ошибка (1-Accuracy)") + ggtitle("Метод опорных векторов (SVM)")+
+    scale_colour_discrete(name="Выборка", labels=c("Обучающая", "Тестовая")) + 
+    scale_shape_discrete(name="Выборка", labels=c("Обучающая", "Тестовая"))
+
+
+```
+
+Из графика видим очень маленькую ошибку на обучающих данных и большую ошибку на тестовых данных. Из этого следует, что модель страдает от большого разброса (переобучена). Для улучшения модели следует сделать следующее:
+
+  - увеличить размер обучающей выборки, сейчас `r nrow (dfTrain)` экземпляров.
+  - сократить количество параметров, сейчас `r ncol(dfTrain)-1-sum(nzv$nzv)`.
+  
+Проведем анализ сдвига/разброса на основе Логистической регрессии c параметром nIter =`r paramLogReg`.
+```{r biasAndVarianceLogReg, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
+set.seed(1234)
+res <- data.frame()
+for  (m in 18:nrow(dfTrain)) {
+    mod <- train (class ~ ., method="LogitBoost", 
+                    data = dfTrain [1:m, -c(1, which(nzv$nzv))],
+                    trControl = trainControl(method = "cv", number=10, repeats=10),
+                    tuneGrid = data.frame(nIter = paramLogReg))
+    predictionsTrain <- predict (mod, newdata = dfTrain[1:m, -c(1, which(nzv$nzv))])
+    accTrain <- confusionMatrix(predictionsTrain,dfTrain$class[1:m], positive="1")$overall[1]    
+    predictions <- predict (mod, newdata = dfTest)
+    accTest <- confusionMatrix(predictions,dfTest$class, positive="1")$overall[1]
+    res <- rbind(res, data.frame(m=m, errorTrain = 1-accTrain, errorTest = 1-accTest))
+}
+
+ggplot(aes (x=m, y=value, colour=variable, shape=variable), data = melt (res, id="m")) + 
+    geom_line(size=1) + geom_point(size=5) +
+    xlab("Размер обучающей выборки (m)") + 
+    ylab ("Ошибка (1-Accuracy)") + ggtitle("Логистическая регрессия")+
+    scale_colour_discrete(name="Выборка", labels=c("Обучающая", "Тестовая")) + 
+    scale_shape_discrete(name="Выборка", labels=c("Обучающая", "Тестовая"))
+
+
+```
+
+Выводы аналогичны выводам, сделанным для метода опорных векторов, однако, здесь ошибка на тестовой выборке уменьшается быстрее, что означает, что, скорее всего, для логистической регрессии понадобится меньгая обучающая выборка для того, чтобы она перестала быть переобученной (overfitted).
+
+### Интерпретация обученной модели Логистическая регрессия
+
+## Классификация новых пользователей (предсказание)
+
+Предскажем категорию Интересен/не интересен для ранее не рассмотренных пользователей. Используем модель на основе логистической регрессии, которая показала наивысшую точность **~75%**. Результат экспортируем в Excel файл для дальнейшего анализа и использования.
+
+```{r predictNew, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
+predicted <- predict (modLogReg, newdata = dfMOMosNormalized)
+dfPredicted <- data.frame (uid = dfMOMosNormalized$uid, classPredicted = predicted,
+                           stringsAsFactors = FALSE)
+
+dfMOMos <- readRDS ("data/MaldivesMOMosClassified.rds")
+
+dfMOMosPred <-  dfMOMos %>% left_join(dfPredicted, by = c("uid" = "uid")) 
+# saveRDS (dfMOMosPred, "data/MaldivesMOMosPrediction.rds")
+# require (xlsx)
+# write.xlsx2(dfMOMosPred, "./data/MaldivesMembersMosPrediction.xlsx", row.names = FALSE, showNA = FALSE)
+
+table (dfMOMosPred$classPredicted)
+```
+
+
+
+## Оценка качества предсказания на новых данных
+
+Предсказанные классы данных были показаны эксперту и по ним получено его мнение. Оценим точность предсказания.
+
+
+
+```{r iteration1Accuracy, echo=FALSE, warning=FALSE, message = FALSE, cache=FALSE}
+#PS. Обработка данных от эксперта приведена в obtainClasses.R
+
+dfMOMos2 <- readRDS ("data/MaldivesMOMosClassified2.rds")
+dfTmp <- dfMOMos2 %>% select(uid, classInitial1, comment1, class1, classPredicted1,
+                             classInitial2, comment2, class2) %>%
+    filter(!is.na(classInitial2))
+#View(dfTmp)
+confusionMatrix(data = as.factor(dfTmp$classPredicted1), 
+                reference = as.factor(dfTmp$class2))
+```
+
+Видим, что точность предсказания составляет порядка 71,6%, при этом система лучше предсказывает "не интересных" клиентов и чаще ошибается, считая "интересных" клиентов не интересными. 
+
+### Выводы
+
+Необходимо продолжить обучение модели. Направления дальнейших исследований:
+
+1. Повторить выбор алгоритма классификации с учетом расширенного набора тестовых примеров.
+
+2. Изменить параметры, используемые для анализа пользователей TripAdvisor:
+    
+    - Скачать информацию обо всех отелях и ресторанах, посещенных пользователем. 
+    - Сформиировать списки VIP и "не VIP" мест (отелей и ресторанов). 
+    - Вместо категорийных параметров был/не был в отеле использовать параметры "Количество посещенных VIP мест" и "Количество посещенных не-VIP мест"
+    
+3. Повторить выбор алгоритма классификации с учетом сокращенного набора параметров пользователя.
+
+```{r stopCluster, echo=FALSE, warning=FALSE, message = FALSE, cache=FALSE}
+  stopCluster(cl) # Explicitly free up cores again.
+
+```
+  

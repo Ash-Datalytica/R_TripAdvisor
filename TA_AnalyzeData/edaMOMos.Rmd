@@ -1,0 +1,313 @@
+---
+title: "Разведочный анализ данных о пользователях TripAdvisor"
+author: "Alexey Shovkun"
+date: "Tuesday, April 14, 2015"
+output: html_document
+---
+
+## Разведка исходных даных 
+
+```{r init, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+#eval(parse('C:/Work/R_Sentiment/textFunctions.R',encoding = "UTF-8"))
+
+require (ggplot2); 
+#require(gridExtra)
+require (PerformanceAnalytics)  #chart.Correlation()
+library(AppliedPredictiveModeling)
+transparentTheme(trans = .4)
+require (stringi)
+require (dplyr)
+require(tidyr) #unnest
+require(reshape2) #dcast
+require(caret) #dummyVars, featurePlot
+
+dfMOMos <- readRDS("data/MaldivesMOMosClassified.rds") 
+
+```
+
+Посмотрим на данные. 
+```{r summary, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
+head (dfMOMos)
+```
+
+Таблица с данными содержит столбцы с описательными параметрами, которые являются уникальными для каждого пользователя и не могут влиять на классификацию интересен/не интересен: memberName, urlMessage, url. При решении задачи классификации будем игнорировать эти параметры.
+
+Числовые параметры *Count могут содержать пустые значения (NA), заменим их на 0. Также необходимо нормализовать числовые параметры, приведя их к значениям в диапазоне [0, 1].
+
+```{r prepareFeatures, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
+dfMOMos$class <- as.factor(as.numeric(dfMOMos$class))
+
+dfMOMos <- dfMOMos %>% select(-memberName, -urlMessage, -url)
+
+features <- colnames (dfMOMos)
+countFeatures <- features[stri_detect_fixed(features, "Count")]
+#naFeaturesTozero <- unique(c("category", countFeatures, ratingFeatures))
+naFeaturesTozero <- countFeatures
+for (i in 1:length(naFeaturesTozero) ) {
+    dfMOMos[naFeaturesTozero[i]][is.na(dfMOMos[naFeaturesTozero[i]])] <- 0
+}
+
+#View (dfMOMos[naFeaturesTozero][])
+#str(dfMOMos)
+#View(dfMOMos)
+
+dfMOMos$memberTitle[is.na(dfMOMos$memberTitle)] <- "Без титула"
+dfMOMos$memberTitle <- factor(dfMOMos$memberTitle, ordered=TRUE,
+                              levels=c("Без титула", "Младший критик", "Критик", "Старший критик", 
+                                       "Эксперт", "Профессиональный критик"))
+#str(dfMOMos$memberTitle)
+
+#2 раза специально, чтобы получить NA значения в table(). Почему - НЕ ПОНЯТНО
+# после 1-го вызова получаем 
+# Factor w/ 3 levels "женщина","мужчина",..: 2 NA NA NA NA 2 NA 1 NA NA ...
+# после 2-го вызова получаем 
+# Factor w/ 3 levels "женщина","мужчина",..: 2 3 3 3 3 2 3 1 3 3 ...
+dfMOMos$sex <- factor(dfMOMos$sex, ordered=FALSE,
+                        exclude = NULL, # чтобы NA был уровнем фактора
+                              levels=c(NA, "женщина", "мужчина"))
+dfMOMos$sex <- factor(dfMOMos$sex, ordered=FALSE,
+                        exclude = NULL, # чтобы NA был уровнем фактора
+                              levels=c(NA, "женщина", "мужчина"))
+#str(dfMOMos$sex)
+#table (dfMOMos$sex)
+
+
+#unique(dfMOMos$ageGroup)
+# Тут достаточно одного вызова factor(), чтобы получить NA значения в виде отдельного уровня фактора
+dfMOMos$ageGroup[dfMOMos$ageGroup==""] <- NA
+dfMOMos$ageGroup <- factor(dfMOMos$ageGroup, ordered=TRUE,
+                        exclude = NULL, # чтобы NA был уровнем фактора
+                              levels=c(NA, "Не более 12", "13-17",  "18-24", "25-34", "35-49", "50-64", "65+"))
+#str(dfMOMos$ageGroup)
+
+dfMOMos$country <- factor (dfMOMos$country, exclude=TRUE)
+#str(dfMOMos$country )
+#levels(dfMOMos$country )
+#summary (dfMOMos$country)
+
+dfMOMos$city <- as.factor (dfMOMos$city)
+#str(dfMOMos$city)
+#summary (dfMOMos$city)
+
+#только классифицированные пользователи
+dfTrain <- dfMOMos[!is.na(dfMOMos$class),]
+#View (dfTrain)
+```
+
+
+```{r correlation, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
+chart.Correlation(dfTrain[,c("class", countFeatures)])
+```
+
+Из таблицы корреляции делаем вывод, что необходимо нормировать числовые значения.
+
+```{r featuresReviews, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
+featurePlot (x = dfTrain[ ,c(countFeatures[1:5])],
+             y = as.factor(dfTrain$class),
+             plot="pairs", auto.key=list(columns=2))
+```
+
+Из графика видим:
+
+1. параметр reviews1Count полезен для классификации
+
+2. большая часть точек сосредоточена в области низких значений, соответственно нормирование может улучшить избирательную способность остальных параметров ("reviews(2-5)Count"")
+
+```{r featuresSet2, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
+featurePlot (x = dfTrain[ ,c(countFeatures[6:9])],
+             y = as.factor(dfTrain$class),
+             plot="pairs", auto.key=list(columns=2))
+```
+
+Из графика видим: 
+
+- Интересующие нас категории (0-не инетресен, 1 - интересен) сильно перемешаны. Визуально выделить эти классы пользователей на основе представленных параметров нельзя.
+
+- CPYCount имеет выброс. Необходимо нелинейное нормирование, которое "растянет середину". Используем предобразование Yeo-Johnson, которое делает данные близкими к нормальному (гауссовому) распределению, затем приведем данные к диапазону [0, 1]
+
+- Остальные параметры следует отнормировать линейно в диапазон [0, 1].
+
+```{r featuresSet3, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE, fig.width=8}
+featurePlot (x = dfTrain[ ,c("memberTitle", "sex", "registrationYear", "ageGroup")],
+             y = as.factor(dfTrain$class),
+             plot="pairs", auto.key=list(columns=2))
+table (dfTrain$sex)
+```
+
+Из графика видим: 
+
+- звание пользователя (memberTitle) - полезный параметр для разделения классов. Оставим его упорядоченным категориальным, хотя могли бы сделать числовым в диапазоне [0, 1].
+
+- пол (sex) - Может иметь значение для нашей задачи. Плохо, что данный параметр имеет довольно большоей количество неопределенных значений. **Необходимо применить алгоритм предсказывания пола перед предсказыванием категории клиента "инетресен/не инетересен".** Для начала используем алгоритм, реализованный в библиотеке caret (preProcess, method = ("knnImpute", "bagImpute")). Для улучшения качества работы всей классифицируещй цепи целесообразно применить методы определения пола на основе текстов отзывов, т.е. с использованием набора данных "MaldivesHotelReviews".
+
+- год регистрации (registrationYear) - теоретически не должен влиять на решаемую задачу, однако график показывает, что влияние есть. Нормируем этот параметр в диапазон [0, 1].
+
+- возрастная группа (ageGroup) - имеет определенную корреляцию с категорией (классом) пользователя. Плохо, что содержит большое количество неопределенных значений, что в обучающей выборке отсутствуют данные для групп (менее 12 лет", "13-17 лет", "18-24", "65+"). Предполагаю, что для качественного предсказания возрастной группы понадобится заметно больше обучающих данных и, даже если мы из получим, не факт, что результат предсказания будет достаточно точным. Планирую попробовать варианты:
+     - заполнять отсутствующие значения "дешевым" методом "knnImpute". 
+     - сделать поле числовым в диапазоне [0, 1], подумать над методом заполнения ("medianImpute", линейная регрессия, ...).
+     - ввести новую категорию "возраст не известен". Тогда этот параметр не будет "мешать" прогнозированию, если он ен известен. Возможно, это даст такой же результат, как и предыдущий вариант (медиана).
+
+```{r featuresSet4, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
+featurePlot (x = dfTrain[ ,c("country", "city")],
+             y = as.factor(dfTrain$class),
+             plot="pairs", auto.key=list(columns=2))
+
+```
+
+Несмотря на то, что интуитивно кажется, что представленные на графике параметры Страна (country) и Город (city) не должны иметь значения, т.к. в рассматриваемом наборе данных пользователи уже отобраны по геопризнаку "Москва и окрестности", график показывает, что эти параме ры могут быть полезны для классификации. Преобразуем их в категориальные (бинарные) переменные.
+
+## Подготовка параметров набора данных
+
+Выполним преобразования параметров набора данных в соответствии с принятыми ранее решениями:
+ - class - оставляем фактором.
+ - review*Count, publicationsCount, helpfulCount, citiesCount, registrationYear - преобразование Yeo-Johnson, затем нормализация в диапазон [0, 1].  
+ - CPYCount - преобразование Yeo-Johnson, затем нормализация в диапазон [0, 1]*.
+ - memberTitle -  оставим его упорядоченным фактором.
+ - ageGroup - заменяем NA на "Возраст не известен"*. Оставляем фактором. 
+ - sex - заменяем NA на предсказанные значения (bagImpute)*. Оставляем фактором.
+ - city - оставляем фактором.
+ - country - заменяем NA на "Россия"*. Оставляем фактором.
+ - tagsList, hotelsReviews - разворачиваем в категориальные (бинарные) переменные.
+
+*) Возможно другое решение.
+
+```{r prepareFeatures2, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
+
+## review*Count, ..., CPYCount, registrationYear
+normalizeList <- stri_subset_fixed(colnames(dfMOMos), "Count") #все *Count, включая CPYCount 
+normalizeList <- c(normalizeList, "registrationYear") #
+preProcNumeric <- preProcess (dfMOMos[normalizeList], method=c("YeoJohnson", "range") )
+dfNormalized <- data.frame(uid = dfMOMos$uid, predict(preProcNumeric,dfMOMos[normalizeList]),
+                           stringsAsFactors = FALSE)
+#View(dfNormalized)
+
+## memberTitle . Эксперимент. Число в диапазоне [0, 1]
+#table(dfMOMos$memberTitle)
+#levels(dfMOMos$memberTitle)
+dfMOMos$memberTitle <- (as.numeric(dfMOMos$memberTitle)-1)/5
+
+## ageGroup
+levels(dfMOMos$ageGroup)[1] <- "Возраст не известен"
+#dfMOMos$ageGroup [is.na(dfMOMos$ageGroup)] <- "Возраст не известен"
+#table(dfMOMos$ageGroup)
+
+## sex
+levels(dfMOMos$sex)[1] <- "Пол не известен"
+#table(dfMOMos$sex)
+
+## country
+dfMOMos$country <- as.character(dfMOMos$country)
+dfMOMos$country[is.na(dfMOMos$country)] <- "Россия"
+dfMOMos$country <- factor (dfMOMos$country, exclude=TRUE)
+#table(dfMOMos$country)
+
+
+## tagsList. В каждой ячейке находится список тагов. Раскрываем в матрицу.
+#####
+#table(unlist(dfMO$tagsList), useNA = "ifany")
+dfTags <- select (dfMOMos, uid, tagsList) %>% 
+    # "разворачиваем" ячейку со списком значений в набор строк с одним значением в ячейке.
+    unnest(tagsList) %>% 
+    # разворачиваем столбец значений в набор двоичных булевых столбцов
+    dcast(uid ~ tagsList, fill=0, length) 
+    
+#View (dfTags)
+# Проверка корректности
+# select (dfMO, uid, tagsList) %>% 
+#     inner_join(dfTags, by = c("uid"="uid")) %>% View
+
+#dfTags <- dfTags[-21] #NA
+colnames(dfTags)[2] <- "tagVegetarian"
+colnames(dfTags)[3] <- "tagGourmet"
+colnames(dfTags)[4] <- "tagJoinCulture"
+colnames(dfTags)[5] <- "tagBeach"
+colnames(dfTags)[6] <- "tagFashion"
+colnames(dfTags)[7] <- "tagCities"
+colnames(dfTags)[8] <- "tagShopping"
+colnames(dfTags)[9] <- "tagHistory"
+colnames(dfTags)[10] <- "tagNightLife"
+colnames(dfTags)[11] <- "tagTourist"
+colnames(dfTags)[12] <- "tagNaturalist"
+colnames(dfTags)[13] <- "tagLuxury"
+colnames(dfTags)[14] <- "tagSilence"
+colnames(dfTags)[15] <- "tagExtreme"
+colnames(dfTags)[16] <- "tagFamily"
+colnames(dfTags)[17] <- "tagSenior"
+colnames(dfTags)[18] <- "tagArts"
+colnames(dfTags)[19] <- "tagEconom"
+colnames(dfTags)[20] <- "tagEco"
+colnames(dfTags)[21] <- "tagNone"
+#View (dfTags)
+#####
+
+
+## hotelsReviewed
+######
+dfHotelsReviewed <- select (dfMOMos, uid, hotelsReviewed) %>% 
+    # "разворачиваем" ячейку со списком значений в набор строк с одним значением в ячейке.
+    unnest(hotelsReviewed) %>% 
+    # разворачиваем столбец значений в набор двоичных булевых столбцов
+    dcast(uid ~ hotelsReviewed, fill=0, length) 
+colnames(dfHotelsReviewed)[-1] <- paste0("hotelReviewed_", colnames(dfHotelsReviewed)[-1])
+#убираем неправильные символы из имен столбцов, чтобы R не обрамлял их в кавычки 
+#если этого не сделать, будут ошибки при обучении Decision Tree (rpart)
+colnames(dfHotelsReviewed) <- stri_replace_all_regex(colnames(dfHotelsReviewed), " |-", "_" )
+colnames(dfHotelsReviewed) <- stri_replace_all_fixed(colnames(dfHotelsReviewed), "&", "AND" )
+colnames(dfHotelsReviewed) <- stri_replace_all_regex(colnames(dfHotelsReviewed), ",|\\*|'", "" )
+#View (dfHotelsReviewed)
+#######
+
+## Сборка результирующего датафрейма
+dfMOMosNormalized <- dfMOMos %>% 
+    select (-one_of(normalizeList)) %>%
+    inner_join(dfNormalized, by = c("uid"="uid")) %>%
+    inner_join(dfTags, by = c("uid"="uid")) %>% 
+    inner_join(dfHotelsReviewed, by = c("uid"="uid")) %>%
+    select (-tagsList, -hotelsReviewed)
+
+#View (dfMOMosNormalized)
+#colnames (dfMOMosNormalized)
+
+#saveRDS (dfMOMosNormalized, "data/MaldivesMOMosNormalized.rds") #memberTitle - factor
+#saveRDS (dfMOMosNormalized, "data/MaldivesMOMosNormalized_v2.rds") #memberTitle - число в диапазоне [0, 1]
+```
+
+**Примечание:**  Подготовка данных для всех пользователей, оставивших отзывы об отелях на Мальдивах, приведена в membersFeatures.Rmd.
+
+## Разведка нормализованных данных
+
+Посмотрим заголовок данных после нормализации, выведем первые 40 параметров (столбцов).
+
+```{r headNormalized, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
+head (dfMOMosNormalized[1:40], )
+dfTrain <- dfMOMosNormalized[!is.na(dfMOMosNormalized$class),]
+```
+
+
+```{r featuresReviewsNormalized, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE, fig.width=10}
+#par (mfrow=c(1,2))
+p1 <- featurePlot (x = dfTrain[ ,c(countFeatures[1:5])],
+             y = as.factor(dfTrain$class),
+             plot="pairs", auto.key=list(columns=2))
+p2 <- featurePlot (x = dfTrain[ ,c(countFeatures[6:9])],
+             y = as.factor(dfTrain$class),
+             plot="pairs", auto.key=list(columns=2))
+print (p1, position = c(0,0,0.5,1), more=TRUE)
+print (p2, position = c(0.5,0,1,1))
+```
+
+Из графиков видим, что параметры *Count стали более информативными, однако визуально выделить категории пользователей не просто.
+
+
+```{r featuresSet3and4Normalized, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE, fig.width=8}
+p3 <- featurePlot (x = dfTrain[ ,c("memberTitle", "sex", "registrationYear", "ageGroup")],
+             y = as.factor(dfTrain$class),
+             plot="pairs", auto.key=list(columns=2))
+p4 <- featurePlot (x = dfTrain[ ,c("country", "city")],
+             y = as.factor(dfTrain$class),
+             plot="pairs", auto.key=list(columns=2))
+print (p3, position = c(0,0,0.5,1), more=TRUE)
+print (p4, position = c(0.5,0,1,1))
+
+#table (dfTrain$memberTitle)
+```

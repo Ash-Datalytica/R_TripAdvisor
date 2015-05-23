@@ -1,0 +1,158 @@
+---
+title: "Подготовка параметров пользователя Трипадвизора"
+author: "Alexey Shovkun"
+date: "Sunday, April 05, 2015"
+output: html_document
+---
+
+```{r init, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+#eval(parse('C:/Work/R_Sentiment/textFunctions.R',encoding = "UTF-8"))
+
+require (ggplot2); 
+#require(gridExtra)
+require (stringi)
+require (dplyr)
+require(tidyr) #unnest
+require(reshape2) #dcast
+require(caret) #dummyVars
+
+dfMO <- readRDS("data/MaldivesMOClassified.rds") 
+
+```
+
+На данном этапе подготовим параметры (features) пользователей сайта Tripadvisor.ru на основе имеющегося набора данных, полученного со страниц типа "Member Overlay". В качестве исходного набора данных берем данные обо всех пользователях изо всех стран, оставлявших отзывы хотя бы об одном отеле на Мальдивах.
+
+```{r overview, echo=FALSE,  message=FALSE, warning=FALSE}
+head (dfMO)
+```
+
+Проанализировав структуру исходных данных, принимаем решение выполнить следующие преобразования параметров пользователя:
+
+- без изменений:  uid, memberName, urlMessage, url, class.
+- нормализация в диапазон (0,1): registrationYear, *Count.
+- развертывание текстового столбца в булевы переменные:  memberTitle, ageGroup, sex, country, city.
+- развертывание списочного столбца в булевы переменные: tagsList.
+
+Пользователь может иметь какое-либо звание (memberTitle) или не иметь никакого. Звания организованы в 5 уровней:
+1. Младший критик
+2. Критик
+3. Старший критик
+4. Профессиональный критик
+5. Эксперт
+Для начала развернем этот параметр в 5 двоичных параметров. Другой возможный вариант - один чисчловой параметр в диапазоне [0,1], где 0 соответствует отсутствию звания, а 5 - уровню эксперт.
+
+```{r transformMembers, echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+## tagsList. В каждой ячейке находится список тагов. Раскрываем в матрицу.
+#table(unlist(dfMO$tagsList), useNA = "ifany")
+dfTags <- select (dfMO, uid, tagsList) %>% 
+    # "разворачиваем" ячейку со списком значений в набор строк с одним значением в ячейке.
+    unnest(tagsList) %>% 
+    # разворачиваем столбец значений в набор двоичных булевых столбцов
+    dcast(uid ~ tagsList, fill=0, length) 
+    
+
+# Проверка корректности
+# select (dfMO, uid, tagsList) %>% 
+#     inner_join(dfTags, by = c("uid"="uid")) %>% View
+
+dfTags <- dfTags[-21]
+colnames(dfTags)[2] <- "tagVegetarian"
+colnames(dfTags)[3] <- "tagGourmet"
+colnames(dfTags)[4] <- "tagJoinCulture"
+colnames(dfTags)[5] <- "tagBeach"
+colnames(dfTags)[6] <- "tagFashion"
+colnames(dfTags)[7] <- "tagCities"
+colnames(dfTags)[8] <- "tagShopping"
+colnames(dfTags)[9] <- "tagHistory"
+colnames(dfTags)[10] <- "tagNightLife"
+colnames(dfTags)[11] <- "tagTourist"
+colnames(dfTags)[12] <- "tagNaturalist"
+colnames(dfTags)[13] <- "tagLuxury"
+colnames(dfTags)[14] <- "tagSilence"
+colnames(dfTags)[15] <- "tagExtreme"
+colnames(dfTags)[16] <- "tagFamily"
+colnames(dfTags)[17] <- "tagSenior"
+colnames(dfTags)[18] <- "tagArts"
+colnames(dfTags)[19] <- "tagEconom"
+colnames(dfTags)[20] <- "tagEco"
+#View (dfTags)
+
+# избавляемся от списка, т.к. caret не понимает list внутри дата фрейма
+dfMO <- inner_join(dfMO, dfTags, by = c("uid"="uid")) %>% select (-tagsList)
+rm (dfTags); 
+#View(dfMO)
+dfMO$ageGroup[dfMO$ageGroup==""] <- NA
+dfMO$sex[dfMO$sex == ""] <- NA
+dfMO$country[dfMO$country == ""] <- NA
+dfMO$city[dfMO$city == ""] <- NA
+dfMO$country <- stri_trans_tolower(dfMO$country)
+dfMO$city <- stri_trans_tolower(dfMO$city)
+
+# стран и городов слишком много. не хватает ОЗУ для их "развертывания", да и не ясно, нужно ли это вообще?
+dummies <- dummyVars(uid ~ memberTitle + ageGroup + sex , data = dfMO)
+#head(predict(dummies, newdata = dfMO))
+dfMONew <- predict(dummies, newdata = dfMO)
+dfMONew[is.na(dfMONew)] <- 0 #Избавляемся от NA, устанавливая их = 0 
+
+#Масштабируем числовые поля в интервале [0,1]
+dfMONumeric <- select (dfMO, ends_with("Count")) 
+dfMONumeric[is.na(dfMONumeric)] <- 0 #Избавляемся от NA, устанавливая их = 0 
+
+preProc <- preProcess (dfMONumeric, method="range")
+dfMONumeric <- predict(preProc,dfMONumeric) 
+#View(dfMONumeric)
+
+dfMONormalized <- cbind (uid=dfMO$uid, dfMONew, dfMONumeric, select (dfMO, starts_with("tag")))
+View (dfMONormalized)
+rm (list = c("dfMONew", "dfMONumeric"))
+
+# Старый метод, Вместо него используем caret
+# ## memberTitle
+# dfMemberTitle <- reshape2::dcast(dfMO, uid*memberName ~ memberTitle, fill=0, length)
+# colnames (dfMemberTitle)[3:8] <- c("title2", "title1", "title4", "title3", "title5", "title0")
+# dfMemberTitle <- dfMemberTitle[,c(1,2,8,4,3,6,5,7)]
+# #head(dfMemberTitle)
+# 
+# # альтернативный способ
+# # mMemberTitle <- model.matrix( ~ 0 + memberTitle, dfMO)
+# # colnames (mMemberTitle) <- c("memberTitle2", "memberTitle1", "memberTitle4", "memberTitle3", "memberTitle5")
+# # mMemberTitle <- mMemberTitle[,c(2,1,4,3,5)]
+# # head(mMemberTitle)
+# 
+# 
+# ## ageGroup
+# dfMO$ageGroup[dfMO$ageGroup==""] <- NA
+# dfAgeGroup <- reshape2::dcast(dfMO, uid*memberName ~ ageGroup, fill=0, length)
+# colnames (dfAgeGroup)[3:10] <- c("age1317", "age1824", "age2534", "age3549", "age5064", "age65", "age12", "ageUnknown")
+# dfAgeGroup <- dfAgeGroup[,c(1,2,10,9,3,4,5,6,7,8)]
+# head(dfAgeGroup)
+##собираем итоговый дата фрейм
+#head(cbind(dfMO, dfMemberTitle[-c(1,2)]))
+
+```
+
+```{r kMeans, echo=FALSE,  message=FALSE, warning=FALSE, cache=TRUE}
+wssplot <- function(data, nc=15, seed=20150405){
+    # from http://www.r-statistics.com/2013/08/k-means-clustering-from-r-in-action/
+    wss <- (nrow(data)-1)*sum(apply(data,2,var))
+    for (i in 2:nc){
+        set.seed(seed)
+        wss[i] <- sum(kmeans(data, centers=i)$withinss)
+        }
+    qplot (x=1:nc, y = wss, xlab="Число кластеров",
+         ylab="Сумма квадратов отклонений внутри кластера") +  
+         geom_line(colour='brown', linetype="dashed") + 
+         geom_point(colour = 'salmon', size = 5) 
+}
+
+wssplot (dfMONormalized[-1], 20) # по методу локтя выбираем количество кластеров = 4
+
+set.seed(20150405)
+km <- kmeans (dfMONormalized[-1], centers=4, iter.max = 20 
+              , nstart=50 #сколько раз случайно выбирать кластеры
+              )
+print(km)
+table(km$cluster)
+km$centers
+summary(km)
+```

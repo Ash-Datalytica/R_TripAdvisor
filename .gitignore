@@ -45,5 +45,8 @@ Temporary Items
 # R
 .Rproj.user
 .Rhistory
+.RData
 Data/htmlcache/
 TA_ObtainData/
+*_cache
+*_files

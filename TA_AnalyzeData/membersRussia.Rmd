@@ -1,0 +1,141 @@
+---
+title: "Отбор пользователей Tripadvisor - потенциальных клиентов"
+author: "Alexey Shovkun"
+date: "Thursday, April 02, 2015"
+output: html_document
+---
+
+
+```{r init, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+#eval(parse('C:/Work/R_Sentiment/textFunctions.R',encoding = "UTF-8"))
+
+#require (ggplot2); require(gridExtra)
+require (stringi)
+#require (PerformanceAnalytics)  #chart.Correlation()
+require (dplyr)
+
+dfMO <- readRDS("data/MaldivesMOClassified.rds") 
+
+```
+
+В качестве исходных данных используем таблицу со сводной информацией о пользователях со страниц типа "Member Overlay" Трипадвизора. Таблица вручшую обогащена информацией интересен/не интересен пользователь. Таблица содержит данные обо всех пользователях, которые оставляли отзывы об отелях на Мальдивах на момент анализа сайта (март 2015 года) - **`r nrow(dfMO)`** записей.
+
+## Анализ географии
+
+Сначала посмотрим на пользователей, вручную классифицированных как интересные.
+
+```{r geoClassified, echo=FALSE,  message=FALSE, warning=FALSE, cache=TRUE}
+#table (dfMO$country[dfMO$class==1], useNA = "no" )
+dfMO[ c("country", "city")] [dfMO$class==1 & !is.na(dfMO$class),]
+```
+
+**Интересны ли нам пользователи из Украины, Беларуси, Казахстана?** 
+
+Посмотрим, как географически распределены все остальные пользователи . Выводим 100 первых стран по количеству пользователей.
+
+```{r geoOverview, echo=FALSE,  message=FALSE, warning=FALSE, cache=TRUE}
+
+sort(table (dfMO$country, useNA = "ifany" ), decreasing = TRUE)[1:100]
+#table (dfMO$city, useNA = "ifany" )
+
+rusCountries <- c("россия", "moscow city", "russia")
+
+```
+
+Видим, что Россия называется по-разному: Россия, Russia, Moscow City и т.п. Также видим, что большое количество пользователей не указали страну (значение NA), среди них могут быть интересные для нас россияне.
+
+Посмотрим, как заполнили поле город пользователи, которые не заполнили поле страна.
+
+```{r geoCountryNA, echo=FALSE,  message=FALSE, warning=FALSE, cache=TRUE}
+
+sort(table (dfMO$city[is.na(dfMO$country)], useNA = "ifany" ), decreasing = TRUE)[1:100]
+#table (dfMO$city, useNA = "ifany" )
+
+rusCities <- c("moscow", "москва", "russia", "peterborough", "ekaterinburg")
+```
+
+Видим, что некоторые из них явно указали российские города, например, "Москва", или указали страну "Russia".  
+**Возможно, пользователи, которые не смогли правильно заполнить поля страна и город, не относятся к сфере наших интересов?**  
+Пока однозначного ответа на этот вопрос нет, оставляем их в списке.  Около 6000 пользователей не указали ни страны, ни города. Хотя среди них могут быть россияне, сейчас мы не будем заниматься их поиском. В будущем при необходимости возможно выделение из них россиян за счет применения методов машинного обучения.
+
+Итого, у нас получился список россиян.
+
+```{r filterRussian, echo=FALSE,  message=FALSE, warning=FALSE, cache=TRUE}
+require(dplyr); require (stringi)
+
+rusNames <- union (rusCountries, rusCities)
+dfMORus <- dfMO %>% 
+    filter ((stri_trans_tolower(country) %in% rusNames) | 
+                (is.na(country) & (stri_trans_tolower(city) %in% rusNames)))
+
+table (dfMORus$country)
+sort(table (dfMORus$city), decreasing=TRUE)
+
+#View (dfMORus)
+#saveRDS(dfMORus, "data/MaldivesMembersRus.rds")
+#получение ручной раскраски см в obtainClasses.R
+```
+
+На данном этапе нам удалось сузить список потенциально интересных пользователей Трипадвизора до **`r nrow(dfMORus)`** человек. Россиян оказалось примерно **`r round(nrow(dfMORus)/nrow(dfMO)*100, digits=1)`%**.
+
+**В каких городах находятся потенциально инетересные нам пользователи?** 
+
+**Мнение бизнес экспертов:** 
+
+- Интересны пользователи из Москвы и области.
+- Интересна информация, о каких отелях пользователь оставил отзыв(ы).
+- Интересна информация о частоте поездок.
+
+Отберем пользователей из Москвы и окресностей. Из последней таблицы c распределениеv пользователей из России по городам видим, что нам подходят такие города, как Москва, Moscow, Russia, Россия, Подмосковье, Королев, Коломна, Одинцово, Рязань, Балашиха, Долгопрудный, Sergiyev Posad, Лобня, Ногинск, Пушкино, Раменское, Реутов, Руза, Рыбинск, Серпухов, Солнечногорский район, Тверь, Химки, Чехов. Оставим только тех пользователей, которые указали одно из этих названий либо в параметре "страна", либо в параметре "город". Используем оба параметра, т.к. некоторые пользователи их путают.
+
+Добавим к табице пользователей параметр, содержащий список отелей на Мальдивах, о которых пользователь оставлял отзыв(ы). Поскольку мы изначально отобрали только тех пользователей Трипадвизора, которые оставляли отзывы о Мальдивах, у каждого пользователя в этом столбце будет хотя бы один отель.
+
+Трипадвизор ведет статистику по количеству посещенных горожов (citiesCount). На ее основе вычислдим параметр "CPYCount - Cities Per Year, среднее количество мест за год", который будет показывать интенсивность поездок
+
+
+```{r addFeatures, echo=FALSE,  message=FALSE, warning=FALSE, cache=TRUE}
+require(dplyr)
+
+#1. Фильтруем Москву
+mosCities <- c("moscow", "moscow city", "москва", "подмосковье", "королев", 
+              "коломна", "одинцово", "рязань", "балашиха", "долгопрудный", "sergiyev posad", 
+              "лобня", "ногинск", "пушкино", "раменское", "реутов", "руза", "рыбинск", "серпухов", 
+              "солнечногорский район", "тверь", "химки", "чехов")
+mosCountries <- union(mosCities, c("russia", "россия"))
+
+dfMOMos <- dfMORus %>% 
+    filter ((stri_trans_tolower(country) %in% mosCities) | 
+                (stri_trans_tolower(city) %in% mosCities))
+#View (dfMOMos)
+#table (dfMOMos$country)
+sort(table (dfMOMos$city), decreasing=TRUE)
+
+#2. Добавляем список отелей
+if (!exists("dfReviews")) {
+    dfReviews <- readRDS("data/MaldivesHotelReviews.rds")
+}
+if (!exists("dfHotelsExt")) {
+    dfHotelsExt <- readRDS("data/MaldivesHotelsExt.rds")
+}
+dfR <- dfReviews %>% select (locationID, uid)
+dfH <- dfHotelsExt %>% select (locationID, name)
+
+dfTmp <- dfMOMos %>% select (uid) %>% inner_join(dfR, by=c("uid"="uid")) %>% unique %>% 
+    inner_join(dfH, by=c("locationID"="locationID")) 
+dfTmp <- (data.frame(tapply (dfTmp$name, dfTmp$uid, array, simplify=FALSE)))
+colnames (dfTmp) [1] <- "hotelsReviewed"
+dfTmp$uid <- rownames(dfTmp)
+
+#делаем left_join, хотя ожидаем, что он будет равен inner_join, 
+#т.е. каждый пользователь имеет хотя бы один отзыв об отеле на Мальдивах
+dfMOMos <- dfMOMos %>% left_join(dfTmp, by = c("uid"="uid"))
+
+#3. Добавляем интенсивность
+# За текущий год берем максимальный (самый поздний) год регистрации пользователя. На момент написания кода - 2015
+maxYear <- max(dfMOMos$registrationYear)+0.5 # полгода для того, чтобы не было деления на 0
+dfMOMos <- dfMOMos %>% mutate (CPYCount = citiesCount/(maxYear-registrationYear))
+
+#View (dfMOMos)
+#saveRDS(dfMOMos, "data/MaldivesMembersMos.rds")
+#получение ручной раскраски см в obtainClasses.R
+```

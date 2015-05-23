@@ -1,0 +1,164 @@
+---
+title: "Разведочный анализ данных TripAdvisor об отелях"
+output: html_document
+---
+
+```{r init, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+#eval(parse('C:/Work/R_Sentiment/textFunctions.R',encoding = "UTF-8"))
+
+require (ggplot2); require(gridExtra)
+require (stringi)
+require (PerformanceAnalytics)  #chart.Correlation()
+require (dplyr)
+
+dfHotelsExt <- readRDS("data/MaldivesHotelsClassified.rds") 
+
+```
+
+### Анализ доступных параметров отеля
+
+Посмотрим на общую статистику по имеющимся параметрам отеля.
+
+```{r chunk, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
+summary (dfHotelsExt)
+```
+Видим большое количество отсутствующих значений (NA). Например, параметр отеля **rating1Count** означает количество отзывов, в которых отель получил суммарный рейтинг, равный 1 звезде. Отсутствие значения у этого параметра означает, что такой рейтинг не был присвоен ни в одном из отзывов. Логичным будет заменить отсутствующие значения у всех параметров, отражающих количество отзывов на 0.
+
+Также у некоторых отелей отсутствует **рейтинг** по какой-либо из категорий, например, sleepRating - рейтинг качества сна, измеряется в звездах от 1 до 5. Однако, если ни в одном из отзывов отель не получил ни одной оценки по данному параметру, то он содержит пустое значение (NA). Логичным будет заменить отсутствующие значения рейтингов на 0.
+
+Если отель не имеет категории, выраженной звездами, будем считать. что его категория равна "0 звезд".
+
+Рейтинг отеля может иметь дробное значение, например "4.5 звезды". В исходных приведен умноженный на 10 рейтинг, т.е. в данном случае он записан ка "45". Тоже самое касается категории (количества звезд отеля): "5 звезд" записано как "50". Оставляем такую запись без изменений.
+
+```{r prepareFeatures, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
+features <- colnames (dfHotelsExt)
+countFeatures <- features[stri_detect_fixed(features, "Count")]
+ratingFeatures <- features[stri_detect_regex(features, "rating|Rating")]
+naFeaturesTozero <- unique(c("category", countFeatures, ratingFeatures))
+for (i in 1:length(naFeaturesTozero) ) {
+    dfHotelsExt[naFeaturesTozero[i]][is.na(dfHotelsExt[naFeaturesTozero[i]])] <- 0
+}
+#summary (dfHotelsExt)
+#View (dfHotelsExt[naFeaturesTozero][])
+dfHotelsExt$class <- as.numeric(dfHotelsExt$class)
+dfHotelsExt <- select(dfHotelsExt, -firstReviewID)
+#View(dfHotelsExt)
+```
+
+Посмотрим, от каких параметров зависит суммарный рейтинг отеля на Tripadvisor, вычисляемый на основе отзывов полльзователей.
+
+```{r plotCorrelation1, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE, fig.width=7}
+chart.Correlation(dfHotelsExt[,7:13])
+```
+
+Из рисунка видим, что рейтинг (rating) отеля больше у отелей с большим количеством отзывов, а также видим, что чем больше у отлея отзывов с ценкой 5.0, тем выше его рейтинг. При этом связи между рейтингом отеля и количеством отзывов с оценкой 1.0 нет.
+Также видим, что количество оценок 1.0, 2.0, 3.0 и 4.0 очень сильно коррелируют между собой - коэффициент корреляции 0,8-0,96, т.е. чем больше у отеля оценок 1.0, тем больше оценок 4.0.
+Поведение количества наивысших оценок (5.0) отличается: корееляция с оценками 1-4 есть, но заметно ниже ~0,5-0,7.
+При этом есть очень сильная корреляция (0,97)  с количеством отзывов, что означает, что пользователи пишут в основном отзывы с оценками 5.0
+
+```{r plotCorrelation2, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE, fig.width=7}
+chart.Correlation(dfHotelsExt[,c(7:8, 14:17)])
+```
+
+Из рисунка видим, что общее количество отзывов об отеле максимально сильно коррелирует с количеством отзывов пар (0,99), семей (0,85) и одиночных путешественников (0,71). Корреляция с отзывами бизнесменов практически отсутствует (0,18), что означает, что бизнесмены оставляют отзывы не о тех же отелях, что остальные категории путешественников. Также видим, что общее количество отзывов от бизнесменов (не более 100 об одном отеле) и одиночек (не более 50 отзывов) намного меньше, чем от семей (до 450) и пар (до 2500), что означает, что Мальдивы - место отдыха, а не бизнеса, и больше отдыха романтического и семейного, чем одинокого.
+
+```{r plotCorrelation3, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE, fig.width=7}
+chart.Correlation(dfHotelsExt[,c(7,18:24)])
+
+```
+
+Из рисунка видим, что все оцениваемые параметры (место расположения, качество сна и др.) примерно одинаково сильно влияют на общий рейтинг отеля (коэффициент корреляции 0,78-0,85).
+Также видим умеренную положительную корреляцию (0,4-0,5) между рейтингом пользователея и категорией (количеством звезд) отеля.
+
+```{r edaCategory, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE, fig.width=7}
+ggplot (aes(x=category), data=dfHotelsExt) + 
+    geom_histogram(fill = "salmon", binwidth=2, position="identity")
+```
+
+Из графика видим, что в регионе имеется достаточно большое количество отелей без звезд (категория равна 0). Проанализируем их отдельно:
+
+```{r plotCorrelation3a, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE, fig.width=9, fig.height=9}
+chart.Correlation(dfHotelsExt[dfHotelsExt$category == 0,c(7:24)])
+#chart.Correlation(dfHotelsExt[dfHotelsExt$category !=0,c(7:24)])
+#chart.Correlation(dfHotelsExt[dfHotelsExt$category ==0,c(7,18:24)])
+```
+
+на рисунке видим примерно такую же картину, как и на предыдущих графиках, где рассматривали все отели вместе. Далее будем рассматривать отели без звезд (категория равна 0) вместе с остальными.
+
+### Обработка параметров отеля 
+
+Все отели имеют разное количество отзывов, поэтому сравнивать их между собой по количеству отзывов будет некорректно. Вместо количественных параметров сформируем процентные, показывающее долю отзывов каждого типа от общего числа отзывов.
+
+```{r makeFeatures, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
+require(dplyr)
+
+dfData <- dfHotelsExt %>% 
+    mutate (rating1 = ifelse(reviewsCount != 0, rating1Count/reviewsCount, 0), 
+            rating2 = ifelse(reviewsCount != 0, rating2Count/reviewsCount,0),
+    rating3 = ifelse(reviewsCount != 0, rating3Count/reviewsCount, 0),
+    rating4 = ifelse(reviewsCount != 0, rating4Count/reviewsCount, 0),
+    rating5 = ifelse(reviewsCount != 0, rating5Count/reviewsCount, 0),
+    familyReviews = ifelse(reviewsCount != 0, familyReviewsCount/reviewsCount, 0),
+    coupleReviews = ifelse(reviewsCount != 0, coupleReviewsCount/reviewsCount, 0),
+    singleReviews = ifelse(reviewsCount != 0, singleReviewsCount/reviewsCount, 0),
+    businessReviews = ifelse(reviewsCount != 0, businessReviewsCount/reviewsCount, 0)) %>%
+    select (-one_of(countFeatures) )
+#View (dfData)
+```
+
+Проанализируем корреляции нормированных параметров.
+
+```{r plotCorrelation4, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE, fig.width=8, fig.height=6}
+chart.Correlation(dfData[,c(7,14, 16:24)])
+```
+
+Рисунок сильно отличается от предыдущих и показывает заметно другую картину. По сути, видим, что нет смысла делать какие-либо выводы на основе анализа количественных показателей, таких как количество отзывов с рейтингом 1 (rating1Count), и стоит анализировать только долевые параметры отеля.   
+Из рисунка видим следующее (слева-направо, сверху-вниз):
+
+- Общий рейтинг выше у отелей с большим количеством звезд - очевидно.
+
+- Общий рейтинг отеля сильно положительно связан с оценками в 5 баллов (0.81), другими словами, чем выша доля оценок "5 баллов" среди всех оценок отеля, тем выше его общий рейтинг, что логично. Общий рейтинг сильно отрицательно связан с оценками в 1-3 балла и, что любопытно, не сильно коррелирует с оценками "4 балла" (-0,20).
+
+- Общий рейтинг отеля умеренно положительно коррелирует с количеством отзывов от пар (0,39) и слабо коррелирует с количеством отзывов от семей (0,19). Пары гораздо чаще пишут отзывы, чем семьи, поэтому их влияние на рейтинг больше.
+
+- Общий рейтинг отеля отрицательно коррелирует с количеством отзывов от одиноких (-0,43) бизнес (-0,52) путешественников. Эти категории туристов пишут отзывы редко и, если пишут, то чаще отрицательные - корреляция 0,39-0,58 между частотой отзывов 1-3 балла и частотой отзывов от одиноких и путешественников в деловой поездке.
+
+- Интересна связь между категорией (количеством звезд) отеля и частотой отзывов "5 баллов": **отели без категории  получают оценку "5 баллов" в среднем так же часто, как отели категории 5 звезд**.
+
+- Оценки в 1-3 балла коррелируют между собой (0,5-0,6), что означает, что чем больше оценок 1 балл, тем больше оценок в 2 и 3 балла и наоборот.
+
+- Чем чаще отель получает оценку "4 балла", тем реже он получает оценку "5 баллов" (-0,37). 
+
+- Путешественники на Мальдивы разделились на 3 категории: семейные, пары и одиночки с бизнесменами.
+     
+     - Семейные пишут не часто (20-30% отзывов) и дают разнонаправленные отзывы.
+    
+     - Пары пишут часто (~70% отзывов) и дают в основном положительные отзывы.
+     
+     - Одиночки и бизнесмены пишут очень редко (<10%) и дают в основном негативные отзывы.
+
+### Зависимость "интересности отеля" от других параметров
+
+Попробуем визуально обнаружить взаимосвязь инетересующих нас отелей от их параметров. Интересные отели имеют class=1, не интересные class=0.
+
+```{r plotClassCorrelation, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE, fig.width=8, fig.height=6}
+chart.Correlation(dfData[!is.na(dfData$class) ,c(15, 7,14, 16:24)])
+```
+ 
+Из рисунка видим недостаточное количество классифицированных отелей (отсутствие звездочек в перовй строке).
+
+```{r plotRating45, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
+require(gridExtra)
+View (dfData[!is.na(dfData$class),])
+p1 <- ggplot(aes (x=rating4, y= rating5, color = as.factor(class)), data=dfData[!is.na(dfData$class),]) + 
+    geom_point(size=4)
+p2 <- ggplot(aes (x=rating4, y= rating1, color = as.factor(class)), data=dfData[!is.na(dfData$class),]) + 
+    geom_point(size=4)
+p3 <- ggplot(aes (x=rating4, y= businessReviews, color = as.factor(class)), data=dfData[!is.na(dfData$class),]) + 
+    geom_point(size=4)
+p4 <- ggplot(aes (x=rating4, y= category, color = as.factor(class)), data=dfData[!is.na(dfData$class),]) + 
+    geom_point(size=4)
+grid.arrange (p1,p2,p3,p4, ncol=2)
+```
+
+Проведем нормализацию и масштабирование. Выделим методом главных компонет 2 ГП и отобразим их на графике с раскрасской по классу.
