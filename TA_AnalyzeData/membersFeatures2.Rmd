@@ -26,6 +26,7 @@ dfMOMos <- readRDS ("../data/MaldivesMOMosClassified2.rds") #данные со �
 dfPlaces <- readRDS ("../data/PlacesClassified.rds")
 dfMembersCP <- readRDS ("../data/MaldivesMemberCityPage.rds")
 dfMembersMos <- readRDS ("../data/MaldivesMembersMO.rds") #данные со страницы пользователя
+dfPlacesReviews <- readRDS ("../data/PlacesReviews.rds")
 
 ```
 
@@ -40,9 +41,9 @@ dfMembersMos <- readRDS ("../data/MaldivesMembersMO.rds") #данные со с�
 ```{r addPlacesFeatures, echo=FALSE, warning=FALSE, message = FALSE}
 #View(dfMembersCP) #MembersCityPage
 
-dfCPCount <- dfMembersCP %>% select (uid, cityID, placeID, reviewID) %>%
+dfCPCount <-     dfMembersCP %>% select (uid, placeID, reviewID) %>%
     filter (!is.na(placeID)) %>% # отсеиваем отзывы о городах (не конкретных местах)
-    left_join (dfPlaces, by = c("placeID"="placeID", "cityID"="cityID")) %>%
+    left_join (dfPlaces, by = c("placeID"="placeID")) %>% 
     group_by (uid) %>% 
     summarize(VIPPlacesCount = sum(isVIP), nonVIPPlacesCount = sum(isNonVIP)) %>% 
     mutate (VIPPlacesCount = ifelse(is.na(VIPPlacesCount), 0, VIPPlacesCount),
@@ -51,7 +52,57 @@ dfCPCount <- dfMembersCP %>% select (uid, cityID, placeID, reviewID) %>%
 #View(dfCPCount)
 ```
 
+Добавим параметры, вычисленные на основе отзывов о местах:
 
+- **categoty*Percent** - доля отзывов об 1-5 звездных местах от общего числа отзывов.
+- **userRating*Percent** - доля отзывов о местах c пользовательским рейтингм 1-5 от общего числа отзывов.
+
+```{r addPlacesReviewsFeatures, echo=FALSE, warning=FALSE, message = FALSE}
+#View(dfPlacesReviews) 
+
+dfTmp <- dfMembersCP %>% select (uid, placeID) %>%
+    filter (!is.na(placeID)) %>% # отсеиваем отзывы о городах (не конкретных местах)
+    left_join (dfPlacesReviews, by = c("placeID"="placeID")) 
+#View(dfTmp)
+
+# Рассчет процента отзывов по количеству звезд (категории) места
+dfPRCount <-    dfTmp %>% select (uid) %>%    
+    count(uid) %>% 
+    inner_join(dfTmp, by=c("uid"="uid")) %>%
+    select (uid, category, totalCount=n) %>%    
+    group_by(uid, totalCount, category) %>%
+    summarize(categoryCount=n()) %>% 
+    mutate (categoryPercent = categoryCount/totalCount) %>%     
+    ungroup() %>%
+    select (-totalCount, -categoryCount) %>% #чтобы не увеличивать число параметров
+    mutate (category = ifelse(is.na(category),"category00",
+                              paste0("category", category))) %>% 
+    spread(category, categoryPercent, fill=0)
+#View(dfPRCount)
+categoryFeatures <- colnames(dfPRCount)[-1]
+
+# аналогичный расчет, но не для пользовательского рейтинга
+dfTmp2 <-    dfTmp %>% select (uid) %>%    
+    count(uid) %>% 
+    inner_join(dfTmp, by=c("uid"="uid")) %>%
+    select (uid, userRating, totalCount=n) %>%    
+    group_by(uid, totalCount, userRating) %>%
+    summarize(userRatingCount=n()) %>% 
+    mutate (userRatingPercent = userRatingCount/totalCount) %>%
+    ungroup() %>%
+    select (-totalCount, -userRatingCount) %>% #чтобы не увеличивать число параметров
+    mutate (userRating = ifelse(is.na(userRating),"userRating00",
+                              paste0("userRating", userRating))) %>% 
+    spread(userRating, userRatingPercent, fill=0) 
+#View(dfTmp2)
+userRatingFeatures <- colnames(dfTmp2)[-1]
+
+dfPRCount <- dfPRCount %>% 
+    inner_join (dfTmp2, by=c("uid"="uid"))
+#View(dfPRCount)
+```
+
+    
 Обогащаем таблицу параметров со страницы MemberOverlay параметрами с главной стрницы пользователя:
 
 - **citiesCount** - количество посещенных городов, поскольку его значение, указанное на странице MemberOverlay, не вызывает доверие.
@@ -300,13 +351,14 @@ colnames(dfTags)[21] <- "tagNone"
 
 ## Сборка результирующего датафрейма
 dfMOMosNormalized3 <- dfMOMos %>% 
-    select (-one_of(c(normalizeList1, normalizeList2, normalizeList3)), -tagsList, -hotelsReviewed,
+    select (-one_of(c(normalizeList1, normalizeList2)), -tagsList, -hotelsReviewed,
             -reviews1Count, -reviews2Count, -reviews3Count, -reviews4Count, -reviews5Count,
-            -travelStatWorldPercent) %>% 
+            -travelStatWorldPercent) %>% #, -normalizeList3
     inner_join(dfPercent, by = c("uid"="uid")) %>%
     inner_join(dfNormalized1, by = c("uid"="uid")) %>%
     inner_join(dfNormalized2, by = c("uid"="uid")) %>%
     #inner_join(dfNormalized3, by = c("uid"="uid")) %>%
+    inner_join (dfPRCount, by = c("uid"="uid")) %>%
     inner_join(dfTags, by = c("uid"="uid")) #%>%
     #inner_join(dfHotelsReviewed, by = c("uid"="uid")) # для варианта 3b
     
@@ -348,6 +400,25 @@ featurePlot (x = dfTrain[ ,setdiff(c(colnames(dfPercent)), "uid")],
 ```
 Последний график показывает более хорошее разделение классов пользователей (ВИП/не-ВИП), чем первые два.
 
+```{r featuresSet3, echo=FALSE, warning=FALSE, message = FALSE, fig.width=9, fig.height=9}
+#View(dfTrain)
+featurePlot (x = dfTrain[ , categoryFeatures],
+             y = dfTrain$class2,
+             plot="pairs", auto.key=list(columns=2))
+featurePlot (x = dfTrain[ ,userRatingFeatures],
+             y = dfTrain$class2,
+             plot="pairs", auto.key=list(columns=2))
+featurePlot (x = dfTrain[ ,c("category50", "badgeHotelReviewsPercent", "sex", "ageGroup",
+                             "reviews5Percent", "badgeTravellersChoiceCount", "publicationsCount",
+                             "userRating00", "badgeRestaurantReviewsPercent", "tagGourmet",
+                             "VIPPlacesPercent", "tagNaturalist", "category25", "tagJoinCulture",
+                             "category20", "countriesCount", "userRating35", "badgeFirstToReviewPercent",
+                             "userRating25", "tagExtreme", "tagEconom", "reviews4Percent",
+                             "userRating45", "tagCities", "CPYCount", "tagNone", "registrationYear"
+                             )],
+             y = dfTrain$class2,
+             plot="pairs", auto.key=list(columns=2))
+```
 
 ### Количество посещенных VIP мест
 
