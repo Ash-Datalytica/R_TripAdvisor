@@ -8,6 +8,8 @@ output:
       "+RTS", "-K64m", "-RTS"
     ]
 ---
+
+Итерация 2 - используем тот же надор данных, но больше параметров пользователя.
     
 ## Разведка исходных данных 
     
@@ -15,21 +17,25 @@ output:
 #eval(parse('C:/Work/R_Sentiment/textFunctions.R',encoding = "UTF-8"))
 #Sys.setenv(LANG="en")
 #install.packages("rmarkdown", repos="http://cran.gis-lab.info/")
+#install.packages("kernlab")
 #install.packages("stringi")
 #install.packages("ggplot2")
+#install.packages("dplyr")
 #install.packages("reshape2")
 #install.packages("doSNOW")
 #install.packages("rattle")
 #install.packages("e1071")
-#install.packages("dplyr")
+#install.packages("RcppEigen")
 #install.packages("caret")
-#install.packages("randomForest")
+#install.packages("randomCForest")
+#install.packages("nnet")C
 #install.packages("pROC")
 #install.packages("RSNNS")
+#install.packages("rpart")
 #install.packages("rpart.plot")
-
-#require(rpart)
-#require(kernlab)
+#install.packages("caTools")
+#install.packages("mboost")
+#install.packages("gbm")
 
 require (ggplot2)
 #require(gridExtra)
@@ -48,7 +54,8 @@ require(doSNOW)
 require(rattle) #fancyRpartPlot
 
 
-dfMOMosNormalized <- readRDS("../data/MaldivesMOMosNormalized_v3.rds") 
+#dfMOMosNormalized <- readRDS("../data/MaldivesMOMosNormalized_v4.rds") 
+dfMOMosNormalized <- readRDS("../data/MaldivesMOMosNormalized_v3.rds") #дает точность 80%
 #dfMOMosNormalized <- readRDS("../data/MaldivesMOMosNormalized_v3b.rds") #со списокм отелей
 fixEncoding <- function (vec, to="UTF-8") {
     require (stringi)
@@ -60,6 +67,7 @@ fixEncoding <- function (vec, to="UTF-8") {
 dfMOMosNormalized$ageGroup <- as.factor(fixEncoding(dfMOMosNormalized$ageGroup))
 dfMOMosNormalized$sex <- as.factor(fixEncoding(dfMOMosNormalized$sex))
 #View(dfMOMosNormalized)
+#str(dfMOMosNormalized)
 
 
 #require(RevoUtilsMath) #for RRO
@@ -91,6 +99,7 @@ set.seed(20150415)
 dfTrain <- dfMOMosNormalized %>% 
     select(-classInitial1, -comment1, -class1, - classPredicted1,
            -classInitial2, -comment2, class=class2,
+           #-classInitial3, -comment3, class=class3,
            -city, -country # эти параметры могут вносить сильный шум, т.к. у нас маленькая обучающая выборка и из "Королева" может быть только один клиент
            )  %>% 
     filter (!is.na(class))      
@@ -309,7 +318,7 @@ importantFeatures <- c("class", "sex", "ageGroup", objGA$optVariables)
 #                              "userRating45", "tagCities", "CPYCount", "tagNone", "registrationYear"
 #                              )
 ######
-#saveRDS(importantFeatures, "../data/importantFeatures.rds")
+saveRDS(importantFeatures, "../data/importantFeatures.rds")
 ```
 
 ## Обучение модели
@@ -427,7 +436,7 @@ ggplot(aes(x=badgeHotelReviewsPercent, y=category50, colour=class, shape=class),
 ```{r trainRandomForest, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
 #View (dfTrain[importantFeatures])
 #str(dfTrain[importantFeatures])
-nPredictors = ncol(dfTrain)-1
+nPredictors = length(importantFeatures)#ncol(dfTrain)-1
 set.seed(1234)
 modRF <- train (class ~ ., method="rf", 
                 data = dfTrain [importantFeatures],
@@ -975,7 +984,7 @@ ggplot(aes (x=m, y=value, colour=variable, shape=variable), data = melt (res, id
 
 Этот график показывает, что, похоже, что модель не переобучена (графики сошлись), соответственно точность ~80%, которую мы видим на графике для обучающей и тестовой выборок при максимальных значениях размера выборки, является предельной для данной модели. Именно по этому признаку мы будем считать победившей модель "Дерево решений".
 
-Проведем анализ сдвига/разброса на основе Дерева решений c параметрами:
+Проведем анализ сдвига/разброса на основе Stochastic Gradient Boosting c параметрами:
 n.trees = `r modGBM$bestTune$n.trees`, 
 interaction.depth = `r modGBM$bestTune$interaction.depth`, 
 shrinkage = `r modGBM$bestTune$shrinkage`.
@@ -985,9 +994,9 @@ shrinkage = `r modGBM$bestTune$shrinkage`.
 set.seed(1234)
 #library(caret)
 res <- data.frame()
-res <- foreach  (m = seq (ceiling(nrow(dfTrain)*0.6), nrow(dfTrain), length.out=10), 
+res <- foreach  (m = ceiling(seq (nrow(dfTrain)*0.8, nrow(dfTrain), length.out=5)), 
                  .combine=rbind) %dopar% {    
-                     #m=40
+                     #m=45
     rows <- sample (1:nrow(dfTrain),m)    
     mod <- caret::train (class ~ ., method="gbm", 
                   data = dfTrain[importantFeatures][rows, ],
@@ -1010,7 +1019,7 @@ res <- foreach  (m = seq (ceiling(nrow(dfTrain)*0.6), nrow(dfTrain), length.out=
 ggplot(aes (x=m, y=value, colour=variable, shape=variable), data = melt (res, id="m")) + 
     geom_line(size=1) + geom_point(size=5) +
     xlab("Размер обучающей выборки (m)") + 
-    ylab ("Ошибка (1-Accuracy)") + ggtitle("Дерево решений (rpart)")+
+    ylab ("Ошибка (1-Accuracy)") + ggtitle("Stochastic Gradient Boosting (gbm)")+
     scale_colour_discrete(name="Выборка", labels=c("Обучающая", "Тестовая")) + 
     scale_shape_discrete(name="Выборка", labels=c("Обучающая", "Тестовая"))
 
