@@ -9,6 +9,8 @@ output: html_document
 
 ```{r init, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
 #eval(parse('C:/Work/R_Sentiment/textFunctions.R',encoding = "UTF-8"))
+#install.packages("tidyr")
+#install.packages("gridExtra")
 
 require (ggplot2); 
 require(gridExtra)
