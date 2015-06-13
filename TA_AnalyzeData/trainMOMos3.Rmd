@@ -43,6 +43,7 @@ require (ggplot2)
 #library(AppliedPredictiveModeling)
 #transparentTheme(trans = .4)
 require (stringi)
+require (plyr) #gbm, чтобы plyr был загружен до dplyr
 require (dplyr)
 #require(tidyr) #unnest
 require(reshape2) #melt
@@ -54,7 +55,7 @@ require(doSNOW)
 require(rattle) #fancyRpartPlot
 
 
-dfMOMosNormalized <- readRDS("../data/MaldivesMOMosNormalized_v4.rds") 
+dfMOMosNormalized <- readRDS("../data/MaldivesMOMosNormalized_v4b.rds") 
 #dfMOMosNormalized <- readRDS("../data/MaldivesMOMosNormalized_v3.rds") #дает точность 80%
 #dfMOMosNormalized <- readRDS("../data/MaldivesMOMosNormalized_v3b.rds") #со списокм отелей
 fixEncoding <- function (vec, to="UTF-8") {
@@ -97,6 +98,7 @@ set.seed(20150415)
 #только классифицированные пользователи, оставляем class2
 #colnames(dfMOMosNormalized)
 dfTrain <- dfMOMosNormalized %>% 
+    filter (classInitial3 != 2) %>% #не будем обучать модель на пользователях, в которых сами не уверены
     select(-classInitial1, -comment1, -class1, - classPredicted1,
            -classInitial2, -comment2, -class2,
            -classInitial3, -comment3, class=class3,
@@ -105,7 +107,7 @@ dfTrain <- dfMOMosNormalized %>%
     filter (!is.na(class))      
 #View(dfTrain)
 
-inTrain <- createDataPartition(dfTrain$class, p = .7, list = FALSE, times = 1)
+inTrain <- createDataPartition(dfTrain$class, p = .75, list = FALSE, times = 1)
 dfTest <- dfTrain[-inTrain,]
 dfTrain <- dfTrain[inTrain,]
 #str(dfTrain)
@@ -443,6 +445,30 @@ ggplot(aes(x=travelStatWorldPercent, y=category50, colour=class, shape=class),
     geom_hline (aes(yintercept = 0.012), linetype="dashed") +
     geom_vline (aes(xintercept = 0.025), linetype="dashed") +
     ggtitle ("Визуализация полученного Дерева решений")
+
+# разбор ошибок
+# неВИП с высокой category50
+ dfTrain %>% filter (class==0, category50 ==1, travelStatWorldPercent<=0.05) %>% #View
+     dplyr::select (uid, sex, ageGroup) 
+# ВИП с низким процентом посещения мира 
+ dfTrain %>% filter (class==1, travelStatWorldPercent ==0) %>% #View
+     dplyr::select (uid, sex, ageGroup) 
+# dfMOMos <- readRDS ("../data/MaldivesMOMosClassified3.rds")
+# dfMOMos %>% filter(uid=="43E71F7F9FE4212F504B90AD3918713E") %>% View
+
+alpha=1/5
+x <- 0:100
+y <- 1-exp(-alpha*x)
+qplot(x,y, geom="line")
+
+y2 <- 1/(1+exp(-x))
+qplot(x,y2, geom="line")
+
+#tanH
+alpha = 1/6
+y3 <- (exp(alpha*x) - exp(-alpha*x))/(exp(alpha*x) + exp(-alpha*x))
+qplot(x,y3, geom="line")
+qplot(x,tanh(x/6), geom="line")
 ```
 
 Видим, что с ростом объема обучающей выборки данный метод начинает давать более осмысленные результаты. На обучающей выборке получаем довольно высокую точность классификации пользователей ~70%, однако последний график показывает, что построенное дерево решений является не идеальной моделью. С одной стороны, использованные в модели параметры кажутся логичными: 
@@ -621,24 +647,39 @@ varImp(modGLMBoost)
 ### Generalized Linear Model with Stepwise Feature Selection
 
 ```{r trainGLMStepAIC, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
-# #View (dfTrain)
-# set.seed(20150417)
-# modGLMStepAIC <- train (class ~ ., method="glmStepAIC", 
-#                         data = dfTrain [importantFeatures],
-#                         trControl = trainControl(method = "cv", number=10, repeats=10),
-#                         #                 tuneGrid = data.frame(
-#                         #                     nIter = c(20,30,40,45,50, 53, 55, 57, 60, 65, 70, 90,100,110,150,180,200,250,300,400,500)
-#                         #                     )
-#                         tuneLength=2
-# )
-# modGLMStepAIC
-# #modGLMStepAIC$finalModel
-# ggplot(modGLMStepAIC)
+#View (dfTrain)
+set.seed(20150417)
+modGLMStepAIC <- train (class ~ ., method="glmStepAIC", 
+                        data = dfTrain [importantFeatures],
+                        trace = 0, # см. help (stepAIC)
+                        trControl = trainControl(method = "cv", number=10, repeats=10)
+                        #                 tuneGrid = data.frame(
+                        #                     nIter = c(20,30,40,45,50, 53, 55, 57, 60, 65, 70, 90,100,110,150,180,200,250,300,400,500)
+                        #                     )
+                        #,tuneLength=20
+)
+modGLMStepAIC
+#modGLMStepAIC$finalModel
+par(mfrow=c(2,2))
+plot(modGLMStepAIC$finalModel)
+par(mfrow=c(1,1))
+#ggplot(modGLMStepAIC)
+
+
+# разбор аутсайдеров
+# dfTrain[15,1:3]
+# dfMOMos <- readRDS ("../data/MaldivesMOMosClassified3.rds")
+# dfMOMos %>% filter(uid=="43E71F7F9FE4212F504B90AD3918713E") %>% View
+
+acc <- modGLMStepAIC$results[1, "Accuracy"]    
+dfResults  <- rbind(dfResults,
+                    data.frame (model="GLM with Stepwise Feature Selection (glmStepAIC)", 
+                          accuracy=acc))
 ```
 
-Работает очень медленно. За 20 минут нет результата при tuneLength=20.
+Интересная картина на первом графике Residuals vs Fitted. Надо поисследовать аутсайеров № 15, 83, 99, они же "отметились" и на последнем графике Residuals vs Leverage. Второй и третий графики показывают хорошую картину - остатки распредели близко к нормальному распределению.
 
-### Нейросеть с 1 уровнем (pcaNNet)
+### Нейросеть с 1 уровнем (nnet)
 
 Можно применить нейросеть с предварительным отбором параметров на основе метода главных компонент (pcaNNet), но мы уже отобрали наиборлее информативные параметры, поэтому используем обычную одноуровневую нейросеть (nnet).
 
@@ -659,12 +700,8 @@ system.time({
 #                      tuneLength=10
     )
 }) 
-#LONG :
-#pcaNET: acc=54.5, 90 sec, 
-#nnet: acc=54.5, 135 sec
-#SHORT: 
-#pcaNET: acc=56.5, 80 sec, # Интересно, что чем меньше параметров (входной информации), тем точность выше
-#nnet: acc=50.5, 65 sec
+#SHORT GA:
+#nnet: acc=70.1, 10 sec
 
 modNNET
 ggplot(modNNET)
@@ -674,7 +711,7 @@ ggplot(modNNET)
 acc <- modNNET$results[(modNNET$results$size == modNNET$bestTune$size) & 
                 (modNNET$results$decay == modNNET$bestTune$decay), "Accuracy"]    
 dfResults  <- rbind(dfResults,
-                    data.frame (model="Neural network (pcaNNet)", 
+                    data.frame (model="Neural network (nnet)", 
                           accuracy=acc))
 
 ```
@@ -752,7 +789,7 @@ system.time({
     modRSNNS <- train (class ~ ., method="mlp", 
                     data = dfTrain [importantFeatures],
                     trControl = trainControl(method = "cv", number=10, repeats=10),
-                    maxit=1500,                    
+                    maxit= 200, #nrow(dfTrain)*2,                    
                     learnFunc= "BackpropMomentum", 
                     #learning param 0.1:2, momentum term, flat spot elimination value, the maximum difference
                     #see SNNS User Manual, pp. 67
@@ -763,7 +800,11 @@ system.time({
                           )
 #                      tuneLength=4
 )}) 
-#SHORT GA : acc= 61,7 , 30sec, Сходится
+#SHORT GA, TanH, maxit=1500 : acc= 61,7 , 30sec, Сходится. Оверфиттинг
+#SHORT GA, TanH, maxit=300 : acc= 66,2 , 15sec, Сходится
+#SHORT GA, TanH, maxit=200 : acc= 68,75 , 15sec, Сходится
+#SHORT GA, TanH, maxit=150 : acc= 68,8 , 15sec, Сходится
+#SHORT GA, TanH, maxit=100 : acc= 68,6 , 13sec, Сходится
 
 modRSNNS
 #modRSNNS$finalModel
@@ -771,6 +812,7 @@ modRSNNS
 ggplot(modRSNNS)
 #par(mfrow=c(1,1))
 plotIterativeError(modRSNNS$finalModel)
+#modRSNNS$finalModel$IterativeFitError
 # acc <- modRSNNS$results[(modRSNNS$results$size == modRSNNS$bestTune$size) & 
 #             (modRSNNS$results$decay == modRSNNS$bestTune$decay), "Accuracy"]    
 acc <- modRSNNS$results[(modRSNNS$results$size == modRSNNS$bestTune$size), "Accuracy"]    
@@ -779,7 +821,8 @@ dfResults  <- rbind(dfResults,
                           accuracy=acc))
 detach("package:RSNNS", unload=TRUE)
 ```
-Последний график, кажется, говорит о том, что модель не дообучена.
+
+Последний график, показывает, что при увеличении количества итераций ошибка стремится к 0, т.е. модель склонна к переобучению. Ограничим число итераций по правилю "клюшки" 200 итерациями.
 
 ### Stochastic Gradient Boosting, ~AdaBoost (gbm)
 
@@ -825,7 +868,7 @@ modGBM$finalModel
 #gbm.perf (modGBM$finalModel)
 #pretty.gbm.tree(modGBM$finalModel)
 varImp(modGBM)
-#summary(modRSNNS$finalModel)
+#summary(modGBM$finalModel)
 ggplot(modGBM)
 
 acc <- modGBM$results[(modGBM$results$n.trees == modGBM$bestTune$n.trees) & 
@@ -838,7 +881,7 @@ dfResults  <- rbind(dfResults,
 
 Из графика видим, что при достаточно большом количестве деревьев (500 и выше), лучше всего работает маленькое значение параметра скорости обучения (shrinkage = 0.001). Также из графика видно, что модель дает высокую точность при небольших значениях количества деревьев и больших значениях скорости обучения. Скорее всего, это из-за переобученя, поэтому не будем полагаться на автоматически выбранную "лучшую" модель, а возьмем более обученную с большим количеством деревьев и меньшей скоростью обучения, а параметр interaction.depth пусть будет выбран атоматически.
 
-```{r trainGBM2, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
+```{r trainGBM2, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE, eval=FALSE}
 system.time({
     set.seed(20150527)
     modGBM <- train (class ~ ., method="gbm", 
@@ -850,7 +893,7 @@ system.time({
                     ,tuneGrid = expand.grid(
                         #the total number of trees to fit. This is equivalent to the number 
                         #of iterations and the number of basis functions in the additive expansion
-                        n.trees = c(1e4), #1e4 #кол-во деревьев
+                        n.trees = c(1e3), #1e4 #кол-во деревьев
                         #the maximum depth of variable interactions. 1 implies an additive model, 
                         #2 implies a model with up to 2-way interactions, etc.
                         interaction.depth = c(2,3,4,5,6,7,8), 
@@ -862,6 +905,7 @@ system.time({
 )})
 modGBM
 #modGBM$finalModel
+plot(modGBM$finalModel)
 varImp(modGBM)
 ggplot(modGBM)
 acc <- modGBM$results[(modGBM$results$n.trees == modGBM$bestTune$n.trees) & 
@@ -1066,14 +1110,64 @@ ggplot(aes (x=m, y=value, colour=variable, shape=variable), data = melt (res, id
 
 ```
 
+Нейросеть RSNNS с параметрами:
+
+- maxit = 200.
+- learnFunc = BackpropMomentum.
+- learnFuncParams = c(0.1, 0.03, 0.1, 0.01).
+- hiddenActFunc = Act_TanH.
+- size = `r modRSNNS$bestTune$size`.
+
+```{r biasAndVarianceRSNNS, echo=FALSE, warning=FALSE, message = FALSE, eval=TRUE}
+set.seed(1234)
+#library(caret)
+res <- data.frame()
+res <- foreach  (m = ceiling(seq (nrow(dfTrain)*0.7, nrow(dfTrain), length.out=10)), 
+                 .combine=rbind) %dopar% {    
+                     #m=51
+    rows <- sample (1:nrow(dfTrain),m)    
+    mod <- caret::train (class ~ ., method="mlp", 
+                  data = dfTrain[importantFeatures][rows, ],
+                  trControl = caret::trainControl(method = "cv", number=10, repeats=5),
+                  maxit= 200,                     
+                  learnFunc= "BackpropMomentum", 
+                  #learning param 0.1:2, momentum term, flat spot elimination value, the maximum difference
+                    #see SNNS User Manual, pp. 67
+                  learnFuncParams = c(0.1, 0.03, 0.1, 0.01), 
+                  hiddenActFunc = "Act_TanH", 
+                  tuneGrid = data.frame(
+                        size = modRSNNS$bestTune$size
+                        )
+                  )    
+    
+    #as.numeric(predict (mod$finalModel, newData=dfTrain[importantFeatures][rows, ])[,2]>0.5)  
+    predictionsTrain <- predict (mod, newdata = dfTrain[importantFeatures][rows, ])
+    accTrain <- caret::confusionMatrix(predictionsTrain, dfTrain$class[rows], positive="1")$overall[1]
+    predictions <- predict (mod, newdata = dfTest)
+    accTest <- caret::confusionMatrix(predictions,dfTest$class, positive="1")$overall[1]
+    #res <- rbind(res, data.frame(m=m, errorTrain = 1-accTrain, errorTest = 1-accTest))
+    rbind(res, data.frame(m=m, errorTrain = 1-accTrain, errorTest = 1-accTest))
+}
+
+ggplot(aes (x=m, y=value, colour=variable, shape=variable), data = melt (res, id="m")) + 
+    geom_line(size=1) + geom_point(size=5) +
+    xlab("Размер обучающей выборки (m)") + 
+    ylab ("Ошибка (1-Accuracy)") + ggtitle("Нейросеть RSNNS (mlp)")+
+    scale_colour_discrete(name="Выборка", labels=c("Обучающая", "Тестовая")) + 
+    scale_shape_discrete(name="Выборка", labels=c("Обучающая", "Тестовая"))
+
+
+```
+ 
 ### Проверка лучшей модели на тестовой выборке 
  
-В качестве победившей по качеству предсказания на обучающих данных выбираем модель "Дерево решений (rpart)". Оценим качество ее предсказания на тестовой выборке, которую модель на "видела" при обучении.
+В качестве победившей по качеству предсказания на обучающих данных выбираем модель "Stohastic Gradient Boosting (gbm)". Оценим качество ее предсказания на тестовой выборке, которую модель не "видела" при обучении.
  
 ```{r checkAccuracy, echo=FALSE, warning=FALSE, message = FALSE}
 #modFinal <- modLB #61.29%
 #modFinal <- modDT # 54%
-modFinal <- modGBM #54.29%
+modFinal <- modGBM #68.57%
+#modFinal <- modRSNNS #65.7%
 cm <- caret::confusionMatrix(data = predict(modFinal, newdata=dfTest), reference = dfTest$class)
 accFinal <- cm$overal[1]
 cm

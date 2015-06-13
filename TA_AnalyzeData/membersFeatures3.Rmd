@@ -1,0 +1,499 @@
+---
+title: "Подготовка параметров пользователя Трипадвизора. Итерация 3"
+author: "Alexey Shovkun"
+date: "Saturday, June 13, 2015"
+output: html_document
+---
+
+В рамках данной итерации мы уйдем от процентной нормализации для некоторых параметров в пользу гиперболического тангенса.
+
+## Формирование таблицы параметров пользователя
+
+```{r init, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+#eval(parse('C:/Work/R_Sentiment/textFunctions.R',encoding = "UTF-8"))
+#install.packages("tidyr")
+#install.packages("gridExtra")
+
+require (ggplot2); 
+require(gridExtra)
+#require (PerformanceAnalytics)  #chart.Correlation()
+#library(AppliedPredictiveModeling)
+#transparentTheme(trans = .4)
+require (stringi)
+require (dplyr)
+require(tidyr) #unnest
+require(reshape2) #melt
+require(caret) #dummyVars, featurePlot
+trellis.par.set(caretTheme())
+
+dfMOMos <- readRDS ("../data/MaldivesMOMosClassified3.rds") #данные со страницы MemberOverlay
+dfPlaces <- readRDS ("../data/PlacesClassified.rds")
+dfMembersCP <- readRDS ("../data/MaldivesMemberCityPage.rds")
+dfMembersMos <- readRDS ("../data/MaldivesMembersMO.rds") #данные со страницы пользователя
+dfPlacesReviews <- readRDS ("../data/PlacesReviews.rds")
+
+```
+
+Целесообразно иметь код с подготовкой таблицы параметров пользователя в одном месте, поэтому в данном файле мы возьмем исходные ненормализованные данные о пользователях, обогатим их данными о посещении ВИП и не-ВИП мест, и затем проведем нормализацию всех параметров. Алгоритм нормализации в основном будет повторять алгоритм, использованный при первой итерации обучения (см. edaMOMos.Rmd).
+
+На основе данных об отзывах пользователя о месте (MembersCityPage) посчитаем следующие параметры:
+
+ - **VIPBalanceCount** - разница между количеством посещенных VIP и не-VIP мест. Нормализуем с помощью гиперболического тангенса.
+ 
+Нормализация гиперболическим тангенсом дает нам значения в диапазоне (-1,1), сохраняя 0, т.е. если изначально значение было равно 0, то после нормализации оно также будет равно 0. Также "растягиваем" шкалу нормализации таким образом, чтобы значения **VIPBalanceCount** с диапазоне [0;10] растягивались приблизительно в диапазон [0,0.9], т.е. были хорошо отличимы между собой, а значения более 10 "схлопывались"в районе +1.
+ 
+```{r addPlacesFeatures, echo=FALSE, warning=FALSE, message = FALSE}
+x <- -30:30
+qplot(x,tanh(x/6), geom="line")
+
+#View(dfMembersCP) #MembersCityPage
+
+dfCPCount <-     dfMembersCP %>% select (uid, placeID, reviewID) %>%
+    filter (!is.na(placeID)) %>% # отсеиваем отзывы о городах (не конкретных местах)
+    left_join (dfPlaces, by = c("placeID"="placeID")) %>% 
+    group_by (uid) %>% 
+    summarize(VIPPlacesCount = sum(isVIP), nonVIPPlacesCount = sum(isNonVIP)) %>% 
+    mutate (VIPPlacesCount = ifelse(is.na(VIPPlacesCount), 0, VIPPlacesCount),
+            nonVIPPlacesCount = ifelse(is.na(nonVIPPlacesCount), 0, nonVIPPlacesCount),
+            VIPBalanceCount = tanh((VIPPlacesCount-nonVIPPlacesCount)/6)) %>%
+    select (uid, VIPBalanceCount)
+#View(dfCPCount)
+```
+
+Добавим параметры, вычисленные на основе отзывов о местах:
+
+- **categoty*** - нормализованное гиперболическим тангенсом количество отзывов об 1-5 звездных местах.
+- **userRating*** - нормализованное гиперболическим тангенсом количество отзывов о местах c пользовательским рейтингом 1-5.
+- **categoty*Percent** - доля отзывов об 1-5 звездных местах от общего числа отзывов.
+- **userRating*Percent** - доля отзывов о местах c пользовательским рейтингом 1-5 от общего числа отзывов.
+
+Коэффициент нормализации подбираем так, чтобы четко различались до ~30 отзывов.
+
+```{r addPlacesReviewsFeatures, echo=FALSE, warning=FALSE, message = FALSE}
+#View(dfPlacesReviews) 
+
+dfTmp <- dfMembersCP %>% select (uid, placeID) %>%
+    filter (!is.na(placeID)) %>% # отсеиваем отзывы о городах (не конкретных местах)
+    left_join (dfPlacesReviews, by = c("placeID"="placeID")) 
+#View(dfTmp)
+
+# Рассчет процента отзывов по количеству звезд (категории) места
+dfPRCount <-    dfTmp %>% select (uid) %>%    
+    count(uid) %>% 
+    inner_join(dfTmp, by=c("uid"="uid")) %>%
+    select (uid, category, totalCount=n) %>%    
+    group_by(uid, totalCount, category) %>%
+    summarize(categoryCount=n()) %>% 
+    mutate (categoryPercent = categoryCount/totalCount) %>%     
+    ungroup() %>%
+    select (-totalCount, -categoryCount) %>% #чтобы не увеличивать число параметров
+    mutate (category = ifelse(is.na(category),"category00Percent",
+                              paste0("category", category, "Percent"))) %>% 
+    spread(category, categoryPercent, fill=0)
+#View(dfPRCount)
+categoryPercentFeatures <- colnames(dfPRCount)[-1]
+
+# Рассчет нормированного количества отзывов по количеству звезд (категории) места
+dfTmp2 <-    dfTmp %>% select (uid, category) %>%    
+    group_by(uid, category) %>%
+    summarize(categoryCount=n()) %>% 
+    ungroup() %>% 
+    mutate (categoryCountNorm = tanh(categoryCount/18)) %>% 
+    select (-categoryCount) %>% #чтобы не увеличивать число параметров
+    mutate (category = ifelse(is.na(category),"category00",
+                              paste0("category", category))) %>% 
+    spread(category, categoryCountNorm, fill=0) 
+#View(dfTmp2)
+categoryFeatures <- colnames(dfTmp2)[-1]
+
+# аналогичный расчет, но для пользовательского рейтинга
+dfTmp3 <-    dfTmp %>% select (uid) %>%    
+    count(uid) %>% 
+    inner_join(dfTmp, by=c("uid"="uid")) %>%
+    select (uid, userRating, totalCount=n) %>%    
+    group_by(uid, totalCount, userRating) %>%
+    summarize(userRatingCount=n()) %>% 
+    mutate (userRatingPercent = userRatingCount/totalCount) %>%
+    ungroup() %>%
+    select (-totalCount, -userRatingCount) %>% #чтобы не увеличивать число параметров
+    mutate (userRating = ifelse(is.na(userRating),"userRating00Percent",
+                              paste0("userRating", userRating, "Percent"))) %>% 
+    spread(userRating, userRatingPercent, fill=0) 
+#View(dfTmp3)
+userRatingPercentFeatures <- colnames(dfTmp3)[-1]
+
+# Рассчет нормированного количества отзывов для пользовательского рейтинга
+dfTmp4 <-    dfTmp %>% select (uid, userRating) %>%    
+    group_by(uid, userRating) %>%
+    summarize(userRatingCount=n()) %>% 
+    ungroup() %>% 
+    mutate (userRatingNorm = tanh(userRatingCount/18)) %>% 
+    select (-userRatingCount) %>% #чтобы не увеличивать число параметров
+    mutate (userRating = ifelse(is.na(userRating),"userRating00",
+                              paste0("userRating", userRating))) %>% 
+    spread(userRating, userRatingNorm, fill=0) 
+#View(dfTmp4)
+userRatingFeatures <- colnames(dfTmp4)[-1]
+
+
+dfPRCount <- dfPRCount %>% 
+    inner_join (dfTmp2, by=c("uid"="uid")) %>%
+    inner_join (dfTmp3, by=c("uid"="uid")) %>%
+    inner_join (dfTmp4, by=c("uid"="uid"))
+#View(dfPRCount)
+```
+
+    
+Обогащаем таблицу параметров со страницы MemberOverlay параметрами с главной стрницы пользователя:
+
+- **citiesCount** - количество посещенных городов, поскольку его значение, указанное на странице MemberOverlay, не вызывает доверие.
+- **publicationsCount** - берем данные с главной страницы, а если их нет, то с MemberOverlay.
+- **countriesCount** - количество посеценных стран.
+- **badge*Count** - количественные показатели активности и полезности пользователя.
+- **badgeTotalReviewsTitle** - титул пользователя, заменяем взятый из MemberOVerlay.
+- **travelStatDistance** - количество преодаленных километров.
+- **travelStatWorldPercent** - какая часть мира посещена (проценты).
+- **tagsList** - список предпочитаемых видов отдыха, заменяем взятый из MemberOVerlay.
+
+
+```{r addMembersFeatures, echo=FALSE, warning=FALSE, message = FALSE}
+#View(dfMembersMos) 
+#colnames(dfMembersMos)
+
+dfMOMos <- dfMOMos %>% 
+    select(-memberName, -urlMessage, -url, -citiesCount, -CPYCount, -memberTitle, - tagsList,
+           -helpfulCount) %>%
+    left_join (dfMembersMos, by = c("uid"="uid")) %>%
+    mutate (publicationsCount = ifelse(!is.na(publicationsCount.y),publicationsCount.y, publicationsCount.x)) %>%
+    select (-memberName, -publicationsCount.x, -publicationsCount.y)
+
+#View(dfMOMos)
+```
+
+
+
+Добавим параметры интенсивности (за год): 
+
+- **VIPBPYCount** - средняя за год разница между количеством посещенных VIP и не-VIP мест.
+
+И проводим подготовку остальных параметров из таблицы MemberOverlay также, как и на прошлой итерации обучения модели.
+
+```{r prepareFeatures1, echo=FALSE, warning=FALSE, message = FALSE}
+#str(dfMOMos)
+
+## добавляем посчитанные параметры, связяанные с посещенными местами (VIP/nonVIP)
+dfMOMos <- dfMOMos %>% inner_join (dfCPCount, by = c("uid"="uid")) 
+#View(dfMOMos)
+
+## Добавляем интенсивность
+# За текущий год берем максимальный (самый поздний) год регистрации пользователя. На момент написания кода - 2015
+maxYear <- max(dfMOMos$registrationYear)+0.5 # полгода для того, чтобы не было деления на 0
+dfMOMos <- dfMOMos %>% 
+    mutate (
+        #VIPPPYCount = VIPPlacesCount/(maxYear-registrationYear),
+        #nonVIPPPYCount = nonVIPPlacesCount/(maxYear-registrationYear),
+            VIPBPYCount = VIPBalanceCount/(maxYear-registrationYear),
+            CPYCount = citiesCount/(maxYear-registrationYear))
+
+dfMOMos$class1 <- as.factor(as.numeric(dfMOMos$class1))
+dfMOMos$class2 <- as.factor(as.numeric(dfMOMos$class2))
+#dfMOMos$class3 <- as.factor(as.numeric(dfMOMos$class3)) # уже фактор
+
+features <- colnames (dfMOMos)
+countFeatures <- features[stri_detect_fixed(features, "Count")]
+
+
+### Избавляемся от NA в количественных параметрах (*Count, registratioYear и т.п)
+naFeaturesTozero <- c(countFeatures, "travelStatDistance", "travelStatWorldPercent")
+for (i in 1:length(naFeaturesTozero) ) {
+    dfMOMos[naFeaturesTozero[i]][is.na(dfMOMos[naFeaturesTozero[i]])] <- 0
+}
+#View (dfMOMos[naFeaturesTozero][])
+```
+
+Переводим в долю от общего кол-во отзывов данного пользователя. 
+Поскольку параметры reviews*Count парсились со страницы MemberOverlay, а параметр
+badgeTotalReviewsCount парсился с главной страницы пользователя и между ними есть разрыв во времени,
+то для корректного вычисления процента, в знаменателе используем сумму reviews*Count.
+Несмотря на назвыание Percent, сразу считаем долю в диапазоне [0,1], т.к. все процентные
+параметры все равно быдем далее линейно нормализовывать в этот диапазон
+
+```{r prepareFeatures2, echo=FALSE, warning=FALSE, message = FALSE}
+### Долевые. rewiews*Count, travelStatWorldPercent. 
+# rewiews*Count переводим в долю от общего кол-во отзывов данного пользователя
+dfPercent <- dfMOMos %>% 
+    mutate (tmp = reviews1Count+reviews2Count+reviews3Count+reviews4Count+reviews5Count,
+            reviews1Percent = ifelse(tmp == 0, 0, reviews1Count/tmp), 
+            reviews2Percent = ifelse(tmp == 0, 0, reviews2Count/tmp),
+            reviews3Percent = ifelse(tmp == 0, 0, reviews3Count/tmp), 
+            reviews4Percent = ifelse(tmp == 0, 0, reviews4Count/tmp),
+            reviews5Percent = ifelse(tmp == 0, 0, reviews5Count/tmp),
+            travelStatWorldPercent = travelStatWorldPercent/100,
+            badgeHotelReviewsPercent = badgeHotelReviewsCount/badgeTotalReviewsCount,
+            badgeRestaurantReviewsPercent = badgeRestaurantReviewsCount/badgeTotalReviewsCount,
+            badgeAttractionReviewsPercent = badgeAttractionReviewsCount/badgeTotalReviewsCount,
+            badgeHelpfulVotesPercent = badgeHelpfulVotesCount/badgeTotalReviewsCount, 
+            badgeFirstToReviewPercent = badgeFirstToReviewCount/badgeTotalReviewsCount
+            #,VIPPlacesPercent = VIPPlacesCount/badgeTotalReviewsCount
+            ) %>%
+    mutate (badgeHelpfulVotesPercent = badgeHelpfulVotesPercent/max(badgeHelpfulVotesPercent)) %>%
+    select (uid, reviews1Percent, reviews2Percent, reviews3Percent, 
+                    reviews4Percent, reviews5Percent, travelStatWorldPercent,
+                    badgeHotelReviewsPercent, badgeRestaurantReviewsPercent, badgeAttractionReviewsPercent,
+                    badgeHelpfulVotesPercent, 
+                    badgeFirstToReviewPercent
+                    #,VIPPlacesPercent
+            )
+#View(dfPercent)
+# dfMOMos %>% select (badgeTotalReviewsCount, badgeHotelReviewsCount, 
+#                     badgeRestaurantReviewsCount, badgeAttractionReviewsCount) %>% 
+#     mutate (total = badgeHotelReviewsCount+badgeRestaurantReviewsCount+badgeAttractionReviewsCount) %>% View
+
+### Нормализуем НЕлинейно в диапазон [0,1]
+# Нормализуем *Count, кроме review*Count,  ..., CPYCount, travelStatDistance
+# The Box-Cox, Yeo-Johnson and exponential transformations have been "repurposed" here: 
+# they are being used to  transform the predictor variables. The Box-Cox transformation 
+# was developed for transforming the response variable while another method, 
+# the Box-Tidwell transformation, was created to estimate transformations of predictor data.
+# However, the Box-Cox method is simpler, more computationally efficient and is 
+# equally effective for estimating power transformations. The Yeo-Johnson transformation
+# is similar to the Box-Cox model but can accommodate predictors with zero and/or 
+# negative values (while the predictors values for the Box-Cox transformation must be 
+#                  strictly positive.) The exponential transformation of Manly (1976) 
+# can also be used for positive or negative data.
+
+normalizeList1 <- setdiff(c(countFeatures, "travelStatDistance"), 
+                          c("countriesCount", #"VIPBPYCount", "citiesCount", "VIPBalanceCount"
+                            stri_subset_regex(countFeatures, "^reviews")))
+preProcNumeric1 <- preProcess (dfMOMos[normalizeList1], method=c("YeoJohnson", "range") )
+dfNormalized1 <- data.frame(uid = dfMOMos$uid, predict(preProcNumeric1,dfMOMos[normalizeList1]),
+                           stringsAsFactors = FALSE)
+#View(dfNormalized1)
+
+### Нормализуем линейно в диапазон [0,1]: registrationYear
+#reviews*Count уже номализованы
+# "citiesCount" - большие разбросы значений => нелинейно
+normalizeList2 <- c("registrationYear", "countriesCount") 
+preProcNumeric2 <- preProcess (dfMOMos[normalizeList2], method=c("range") )
+dfNormalized2 <- data.frame(uid = dfMOMos$uid, predict(preProcNumeric2,dfMOMos[normalizeList2]),
+                           stringsAsFactors = FALSE)
+#View(dfNormalized2)
+
+## badgeTotalReviewsTitle (ex memberTitle) . Число в диапазоне [0, 1]
+#Отсутствие титула приравниваем к низшему уровню
+dfMOMos$badgeTotalReviewsTitle[is.na(dfMOMos$badgeTotalReviewsTitle)] <- "Новый критик"
+dfMOMos$badgeTotalReviewsTitle <- factor(dfMOMos$badgeTotalReviewsTitle, ordered=TRUE,
+                              levels=c("Новый критик", "Младший критик", "Критик", "Старший критик", 
+                                       "Профессиональный критик", "Эксперт"))
+dfMOMos$badgeTotalReviewsTitle <- (as.numeric(dfMOMos$badgeTotalReviewsTitle)-1)/5
+#table(dfMOMos$badgeTotalReviewsTitle)
+
+## sex
+#2 раза специально, чтобы получить NA значения в table(). Почему - НЕ ПОНЯТНО
+# после 1-го вызова получаем 
+# Factor w/ 3 levels "женщина","мужчина",..: 2 NA NA NA NA 2 NA 1 NA NA ...
+# после 2-го вызова получаем 
+# Factor w/ 3 levels "женщина","мужчина",..: 2 3 3 3 3 2 3 1 3 3 ...
+dfMOMos$sex <- factor(dfMOMos$sex, ordered=FALSE,
+                      exclude = NULL, # чтобы NA был уровнем фактора
+                      levels=c(NA, "женщина", "мужчина"))
+dfMOMos$sex <- factor(dfMOMos$sex, ordered=FALSE,
+                      exclude = NULL, # чтобы NA был уровнем фактора
+                      levels=c(NA, "женщина", "мужчина"))
+levels(dfMOMos$sex)[1] <- "Пол не известен"
+#table(dfMOMos$sex)
+
+## ageGroup
+#unique(dfMOMos$ageGroup)
+# Тут достаточно одного вызова factor(), чтобы получить NA значения в виде отдельного уровня фактора
+dfMOMos$ageGroup[dfMOMos$ageGroup==""] <- NA
+dfMOMos$ageGroup <- factor(dfMOMos$ageGroup, ordered=TRUE,
+                        exclude = NULL, # чтобы NA был уровнем фактора
+                              levels=c(NA, "Не более 12", "13-17",  "18-24", "25-34", "35-49", "50-64", "65+"))
+levels(dfMOMos$ageGroup)[1] <- "Возраст не известен"
+#dfMOMos$ageGroup [is.na(dfMOMos$ageGroup)] <- "Возраст не известен"
+#table(dfMOMos$ageGroup)
+
+## country
+dfMOMos$country[is.na(dfMOMos$country)] <- "Россия"
+dfMOMos$country <- factor (dfMOMos$country, exclude=TRUE)
+#table(dfMOMos$country)
+
+## city
+dfMOMos$city <- as.factor (dfMOMos$city)
+#str(dfMOMos$city)
+#summary (dfMOMos$city)
+
+## tagsList. В каждой ячейке находится список тагов. Раскрываем в матрицу.
+#####
+#table(unlist(dfMO$tagsList), useNA = "ifany")
+dfTags <- select (dfMOMos, uid, tagsList) %>% 
+    # "разворачиваем" ячейку со списком значений в набор строк с одним значением в ячейке.
+    unnest(tagsList) %>% 
+    # разворачиваем столбец значений в набор двоичных булевых столбцов
+    dcast(uid ~ tagsList, fill=0, length) 
+    
+#View (dfTags)
+# Проверка корректности
+# select (dfMO, uid, tagsList) %>% 
+#     inner_join(dfTags, by = c("uid"="uid")) %>% View
+#dfTags <- dfTags[-21] #NA
+colnames(dfTags)[2] <- "tagVegetarian"
+colnames(dfTags)[3] <- "tagGourmet"
+colnames(dfTags)[4] <- "tagJoinCulture"
+colnames(dfTags)[5] <- "tagBeach"
+colnames(dfTags)[6] <- "tagFashion"
+colnames(dfTags)[7] <- "tagCities"
+colnames(dfTags)[8] <- "tagShopping"
+colnames(dfTags)[9] <- "tagHistory"
+colnames(dfTags)[10] <- "tagNightLife"
+colnames(dfTags)[11] <- "tagTourist"
+colnames(dfTags)[12] <- "tagNaturalist"
+colnames(dfTags)[13] <- "tagLuxury"
+colnames(dfTags)[14] <- "tagSilence"
+colnames(dfTags)[15] <- "tagExtreme"
+colnames(dfTags)[16] <- "tagFamily"
+colnames(dfTags)[17] <- "tagSenior"
+colnames(dfTags)[18] <- "tagArts"
+colnames(dfTags)[19] <- "tagEconom"
+colnames(dfTags)[20] <- "tagEco"
+colnames(dfTags)[21] <- "tagNone"
+#View (dfTags)
+#####
+
+# ## hotelsReviewed (вариант 3b)
+# ######
+# dfHotelsReviewed <- select (dfMOMos, uid, hotelsReviewed) %>% 
+#     # "разворачиваем" ячейку со списком значений в набор строк с одним значением в ячейке.
+#     unnest(hotelsReviewed) %>% 
+#     # разворачиваем столбец значений в набор двоичных булевых столбцов
+#     dcast(uid ~ hotelsReviewed, fill=0, length) 
+# colnames(dfHotelsReviewed)[-1] <- paste0("hotelReviewed_", colnames(dfHotelsReviewed)[-1])
+# #убираем неправильные символы из имен столбцов, чтобы R не обрамлял их в кавычки 
+# #если этого не сделать, будут ошибки при обучении Decision Tree (rpart)
+# colnames(dfHotelsReviewed) <- stri_replace_all_regex(colnames(dfHotelsReviewed), " |-", "_" )
+# colnames(dfHotelsReviewed) <- stri_replace_all_fixed(colnames(dfHotelsReviewed), "&", "AND" )
+# colnames(dfHotelsReviewed) <- stri_replace_all_regex(colnames(dfHotelsReviewed), ",|\\*|'", "" )
+# #View (dfHotelsReviewed)
+# #######
+
+## Сборка результирующего датафрейма
+dfMOMosNormalized4 <- dfMOMos %>% 
+    select (-one_of(c(normalizeList1, normalizeList2)), -tagsList, -hotelsReviewed,
+            -reviews1Count, -reviews2Count, -reviews3Count, -reviews4Count, -reviews5Count,
+            -travelStatWorldPercent) %>% #, -normalizeList3
+    inner_join(dfPercent, by = c("uid"="uid")) %>%
+    inner_join(dfNormalized1, by = c("uid"="uid")) %>%
+    inner_join(dfNormalized2, by = c("uid"="uid")) %>%
+    #inner_join(dfNormalized3, by = c("uid"="uid")) %>%
+    inner_join (dfPRCount, by = c("uid"="uid")) %>%
+    inner_join(dfTags, by = c("uid"="uid")) #%>%
+    #inner_join(dfHotelsReviewed, by = c("uid"="uid")) # для варианта 3b
+    
+
+#View (dfMOMosNormalized4)
+
+saveRDS (dfMOMosNormalized4, "../data/MaldivesMOMosNormalized_v4b.rds") #без  посещенных отелей
+
+```
+
+## Разведочный анализ
+
+Проанализируем визуально параметры пользователя.
+
+```{r featuresSet1, echo=FALSE, warning=FALSE, message = FALSE, fig.width=9, fig.height=9}
+#только классифицированные пользователи
+dfTrain <- dfMOMosNormalized4[!is.na(dfMOMosNormalized4$class3),]
+#View (dfTrain)
+#countFeatures[1:5] Отсутствуют, т.к. reviews*Count заменены на reviews*Percent
+featurePlot (x = dfTrain[ ,c(c(countFeatures[c(6,7,16:19)]),"travelStatDistance")],
+             y = dfTrain$class3,
+             plot="pairs", auto.key=list(columns=2))
+featurePlot (x = dfTrain[ ,countFeatures[8:15]],
+             y = dfTrain$class3,
+             plot="pairs", auto.key=list(columns=2))
+
+```
+
+Графики выше показывают, что интересующие нас классы пользователей (ВИП/не-ВИП) все еще сильно смешаны между собой.
+
+Процентные показатели:
+```{r featuresSet2, echo=FALSE, warning=FALSE, message = FALSE, fig.width=9, fig.height=9}
+featurePlot (x = dfTrain[ ,setdiff(c(colnames(dfPercent)), "uid")],
+             y = dfTrain$class3,
+             plot="pairs", auto.key=list(columns=2))
+```
+Последний график показывает более хорошее разделение классов пользователей (ВИП/не-ВИП), чем первые два.
+
+```{r featuresSet3, echo=FALSE, warning=FALSE, message = FALSE, fig.width=9, fig.height=9}
+#View(dfTrain)
+featurePlot (x = dfTrain[ , categoryFeatures],
+             y = dfTrain$class3,
+             plot="pairs", auto.key=list(columns=2))
+featurePlot (x = dfTrain[ , categoryPercentFeatures],
+             y = dfTrain$class3,
+             plot="pairs", auto.key=list(columns=2))
+
+featurePlot (x = dfTrain[ ,userRatingFeatures],
+             y = dfTrain$class3,
+             plot="pairs", auto.key=list(columns=2))
+featurePlot (x = dfTrain[ ,userRatingPercentFeatures],
+             y = dfTrain$class3,
+             plot="pairs", auto.key=list(columns=2))
+
+featurePlot (x = dfTrain[ ,c("category50", "category50Percent", "badgeHotelReviewsPercent", #"sex", "ageGroup",
+                             "publicationsCount", "VIPBPYCount",  "travelStatDistance",  
+                              "countriesCount", "CPYCount",  
+                              "tagExtreme", "tagEconom",  "userRating45", "tagCities"  
+                             )],
+             y = dfTrain$class3,
+             plot="pairs", auto.key=list(columns=2))
+```
+
+### Количество посещенных VIP мест
+
+- **VIPBalanceCount** - разница между количеством посещенных ВИП и не-ВИП мест.
+- **VIPBPYCount** - то же зсамое, но в среднем за год. Умозрительно ожидается, что этот параметр более показательный и честный.
+
+```{r featuresVIPPlaces, echo=FALSE, warning=FALSE, message = FALSE, fig.width=9}
+p1<- ggplot(dfTrain, aes (class2, VIPBalanceCount, fill=class2)) + geom_boxplot()
+p2<- ggplot(dfTrain, aes (class2, VIPBPYCount, fill=class2)) + geom_boxplot()
+grid.arrange(p1, p2, ncol=2)
+```
+
+К сожалению, из графиков видим, что параметры посещения ВИП и не-ВИП мест не сильно выделяют класс ВИП пользователей.
+
+### Параметры Пол и Возраст
+
+```{r featuresSexAge, echo=FALSE, warning=FALSE, message = FALSE, fig.width=9}
+p3 <- qplot(sex, data=dfTrain, fill=class2, position="dodge")
+p4 <- qplot(ageGroup, data=dfTrain, fill=class2, position="dodge")
+grid.arrange( p3, p4, ncol=2)
+#qplot(class2, ageGroup, data = dfTrain, geom=c("boxplot", "jitter"), colour=class2)
+```
+
+```{r debugData, echo=FALSE, warning=FALSE, message = FALSE, eval=FALSE}
+### разбор ситуации, почему у smolkin нет VIP мест
+# dfMOMos <- readRDS ("../data/MaldivesMOMosClassified2.rds") #данные со страницы MemberOverlay
+# dfPlaces <- readRDS ("../data/PlacesClassified.rds")
+# dfMembersCP <- readRDS ("../data/MaldivesMemberCityPage.rds")
+# dfMembersMos <- readRDS ("../data/MaldivesMembersMO.rds") #данные со страницы пользователя
+# 
+# dfCPCount <- dfMembersCP %>% select (uid, cityID, placeID, reviewID) %>%
+#     filter (!is.na(placeID)) %>%
+#     left_join (dfPlaces, by = c("placeID"="placeID", "cityID"="cityID")) %>%
+#     group_by (uid) %>% 
+#     summarize(VIPPlacesCount = sum(isVIP), nonVIPPlacesCount = sum(isNonVIP)) %>% 
+#     mutate (VIPPlacesCount = ifelse(is.na(VIPPlacesCount), 0, VIPPlacesCount),
+#             nonVIPPlacesCount = ifelse(is.na(nonVIPPlacesCount), 0, nonVIPPlacesCount),
+#             VIPBalanceCount = VIPPlacesCount-nonVIPPlacesCount) 
+# #smolkin
+# dfCPCount[dfCPCount$uid=="813EFCF9A589AA6F946F82BB5FF9619E",]
+# dfMembersCP %>% filter (uid=="813EFCF9A589AA6F946F82BB5FF9619E") %>% 
+#     left_join(dfPlaces, by=c("placeID"="placeID")) %>% 
+#     tail(600) %>%
+#     View
+#     group_by (uid) %>% 
+#     summarize(VIPPlacesCount = sum(isVIP), nonVIPPlacesCount = sum(isNonVIP)) %>% 
+#     View
+```
