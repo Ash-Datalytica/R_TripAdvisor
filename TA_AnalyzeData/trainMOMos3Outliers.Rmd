@@ -1,0 +1,516 @@
+---
+title: "Анализ модели классификации пользователей TripAdvisor. Итерация 3"
+author: "Alexey Shovkun"
+date: "Tuesday, June 30, 2015"
+output:
+  html_document:
+    pandoc_args: [
+      "+RTS", "-K64m", "-RTS"
+    ]
+---
+
+Проанализируем качество работы модели, классифицирующей пользователей TripAdvisor, которая была получена на 3-ей итерации.
+
+## Разведка исходных данных 
+    
+```{r initEnvironment, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+eval(parse('common.R',encoding = "UTF-8"))
+
+#Sys.setenv(LANG="en")
+#install.packages("rmarkdown", repos="http://cran.gis-lab.info/")
+#install.packages("kernlab")
+#install.packages("stringi")
+#install.packages("ggplot2")
+#install.packages("dplyr")
+#install.packages("reshape2")
+#install.packages("doSNOW")
+#install.packages("rattle")
+#install.packages("e1071")
+#install.packages("RcppEigen")
+#install.packages("caret", repos="http://cran.us.r-project.org", dependencies = c("Depends", "Imports", "Suggests")) #6.0-47
+#install.packages("caret", repos="http://cran.us.r-project.org") #6.0-47
+#install.packages("caret") #6.0-41
+#install.packages("randomCForest")
+#install.packages("nnet")C
+#install.packages("pROC")
+#install.packages("RSNNS")
+#install.packages("rpart")
+#install.packages("rpart.plot")
+#install.packages("caTools")
+#install.packages("mboost")
+#install.packages("gbm")
+#install.packages("RRF")
+#install.packages("ROCR")
+#install.packages("xtable")
+#install.packages("rattle", repos="http://rattle.togaware.com", type="source") 
+
+require (ggplot2)
+require(gridExtra)
+#require (PerformanceAnalytics)  #chart.Correlation()
+#library(AppliedPredictiveModeling)
+#transparentTheme(trans = .4)
+require (stringi)
+#require (plyr) #gbm, чтобы plyr был загружен до dplyr
+require (dplyr)
+#require(tidyr) #unnest
+require(reshape2) #melt
+#install.packages("rpart.plot")
+require(caret) #dummyVars, featurePlot, train
+trellis.par.set(caretTheme())
+require(parallel) #detectCores()
+require(doSNOW)
+#require(rattle) #fancyRpartPlot
+require(ROCR)
+require (xtable)
+options(xtable.comment = FALSE) # the version and timestamp comment is NOT included
+
+
+#require(RevoUtilsMath) #for RRO
+#getMKLthreads() #1
+nCores <- detectCores()
+#nCores <-6
+cl<-makeCluster(nCores) # Assign number of cores to use
+registerDoSNOW(cl) # Register the cores.
+
+options(stringsAsFactors = FALSE)
+```
+
+```{r initData, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+dfMOMosNormalized <- readRDS("../data/MaldivesMOMosNormalized_v4b.rds") 
+fixEncoding <- function (vec, to="UTF-8") {
+    require (stringi)
+    if (stri_enc_detect(vec)[[1]]$Encoding[1] == "windows-1251"){
+        vec <- stri_encode(vec, from ="windows-1251", to=to)
+    }
+    vec
+}
+dfMOMosNormalized$ageGroup <- as.factor(fixEncoding(dfMOMosNormalized$ageGroup))
+dfMOMosNormalized$sex <- as.factor(fixEncoding(dfMOMosNormalized$sex))
+#View(dfMOMosNormalized)
+#str(dfMOMosNormalized)
+
+```
+
+Выделяем обучающую и тестовую выборки. Проверку качества модели в процессе подбора её параметров будем делать с использованием метода перекрестной проверки (cross validation) на обучающей выборке. Тестовая выборка будет использована **только** для оценки качества результирующей модели.
+
+```{r makeSets, echo=FALSE, warning=FALSE, message = FALSE}
+set.seed(20150415)
+#только классифицированные пользователи, оставляем class2
+#colnames(dfMOMosNormalized)
+dfTrain <- dfMOMosNormalized %>% 
+    filter (classInitial3 != 2) %>% #не будем обучать модель на пользователях, в которых сами не уверены
+    select(-classInitial1, -comment1, -class1, - classPredicted1,
+           -classInitial2, -comment2, -class2,
+           -classInitial3, -comment3, class=class3,
+           -city, -country # эти параметры могут вносить сильный шум, т.к. у нас маленькая обучающая выборка и из "Королева" может быть только один клиент
+           )  %>% 
+    filter (!is.na(class))      
+#View(dfTrain)
+
+inTrain <- createDataPartition(dfTrain$class, p = .75, list = FALSE, times = 1)
+dfTest <- dfTrain[-inTrain,]
+dfTrain <- dfTrain[inTrain,]
+#str(dfTrain)
+
+```
+
+Размеры выборок: 
+    
+- обучающая: `r nrow(dfTrain)` экземпляров.
+
+- проверочная: отсутствует.
+
+- тестовая: `r nrow(dfTest)` экземпляров.
+
+
+## Сокращение и отбор параметров
+
+Мы обладаем небольшой обучающей выборкой, у которой количество параметров (features) сопоставимо или больше количества экземпляров. Для лучшего обучения некоторых моделей, нам стоит отобрать параметры. Для этого мы построим усиленную логистическую регрессию и возьмем 30 наиболее информативных параметров от неё (по убыванию значимости).
+
+```{r selectFeatures, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE}
+#View (dfTrain)
+## nero zero features
+nzv <- nearZeroVar(dfTrain, saveMetrics= TRUE)
+#nzv[nzv$nzv,] # вариация около 0. При перекрестной проверке могут получиться выборки с нулевой вариацией.
+#nzv[nzv$zeroVar,]
+nzvIDX <- which (nzv$nzv)
+nzvFeatures <- colnames(dfTrain)[nzvIDX]
+
+## все столбцы
+allFeatures <- setdiff (colnames (dfTrain)[!nzv$nzv], c("uid"))
+
+set.seed(20150417)
+modGLMBoost <- train (class ~ ., method="glmboost", 
+                      data = dfTrain [allFeatures], #75,7%
+                      #data = dfTrain [importantFeatures], #74,6%
+                      trControl = trainControl(method = "cv", number=10, repeats=10),
+                      tuneGrid = expand.grid(
+                                mstop = c(20,30,40,45,50, 53, 55, 57, 60, 65, 70, 90,100,110,150,180,200,250,300,400,500),
+                                prune="no"
+                                 )
+                      #tuneLength=20
+)
+#modGLMBoost
+#modGLMBoost$finalModel
+#varImp(modGLMBoost)
+#ggplot(modGLMBoost)
+
+importantFeatures2 <- c("class",
+                        rownames(varImp(modGLMBoost)$importance)
+                        [order(varImp(modGLMBoost)$importance$X0, decreasing=TRUE)][1:30])
+
+#intersect (importantFeatures,importantFeatures2)
+importantFeatures2
+```
+
+
+## Обучение модели - Нейросеть с 1 уровнем (nnet)
+
+
+```{r trainNNET, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE, eval=TRUE}
+#View (dfTrain [, -c(1, which(nzv$nzv))])
+#pcaNNet=Neural Networks with Feature Extraction
+maxIter <- 5000
+#system.time({
+    set.seed(20150520)
+    modNNET <- train (class ~ ., method="nnet", #nnet, pcaNNet
+                     data = dfTrain [importantFeatures2], # 76.4%
+                     maxit = maxIter, #Макс
+                     trace=FALSE, # FALSE-для более быстрого рассчета
+                     trControl = trainControl(method = "cv", number=10, repeats=10),
+                     tuneGrid = expand.grid(
+                          decay = c(0.01, 0.033, 0.1, 0.33, 0.9), #1e-4, 1e-3,
+                          size = c(3, 4, 5, 6, 7, 8, 10)
+                     )
+#                      tuneLength=10
+    )
+#}) 
+
+#modNNET
+#ggplot(modNNET)
+modNNET$finalModel
+#summary(modNNET$finalModel)
+acc <- modNNET$results[(modNNET$results$size == modNNET$bestTune$size) & 
+                (modNNET$results$decay == modNNET$bestTune$decay), "Accuracy"]    
+
+```
+
+Модель на основе нейросети довольно сложно интерпретировать, поэтому ограничимся значимостью параметров пользователя для модели, чем больше, тем больше параметр влияет на выбор категории пользователя ВИП/не-ВИП.
+
+```{r varImp, echo=FALSE, warning=FALSE, message = FALSE}
+varImp(modNNET)
+```
+
+Наиболее информативными для предсказательной модели оказались следующие параметры:
+
+ - Количество отзывов об отелях, отмеченных признаком Travaller's Choice.
+ - Процент отзывов с оценкой 5 от общего числа отзывов пользователя.
+ - Процент отзывов о местах (отелях) уровня 5 звезд от общего числа отзывов пользователя.
+ - Наличие беджа "Любитель роскоши" у пользователя.
+
+Проведем анализ полноты обучения для полученной нейросети nnet с параметрами:
+
+- maxit = **`r maxIter`**,
+- size = **`r modNNET$bestTune$size`**,
+- decay = **`r modNNET$bestTune$decay`**.
+
+```{r biasAndVarianceNNET, echo=FALSE, warning=FALSE, message = FALSE, cache=TRUE, eval=TRUE}
+set.seed(1234)
+#library(caret)
+res <- data.frame()
+res <- foreach  (m = ceiling(seq (nrow(dfTrain)*0.3, nrow(dfTrain), length.out=20)), 
+                 .combine=rbind) %dopar% {    
+                     #m=51
+    rows <- sample (1:nrow(dfTrain),m)    
+    mod <- caret::train (class ~ ., method="nnet", 
+                  data = dfTrain[importantFeatures2][rows, ],
+                  trControl = caret::trainControl(method = "cv", number=10, repeats=5),
+                  maxit= maxIter,                     
+                  trace = FALSE,
+                  tuneGrid = data.frame(
+                        size = modNNET$bestTune$size,
+                        decay = modNNET$bestTune$decay
+                        )
+                  )    
+    
+    #as.numeric(predict (mod$finalModel, newData=dfTrain[importantFeatures][rows, ])[,2]>0.5)  
+    predictionsTrain <- predict (mod, newdata = dfTrain[importantFeatures2][rows, ])
+    accTrain <- caret::confusionMatrix(predictionsTrain, dfTrain$class[rows], positive="1")$overall[1]
+    predictions <- predict (mod, newdata = dfTest)
+    accTest <- caret::confusionMatrix(predictions,dfTest$class, positive="1")$overall[1]
+    #res <- rbind(res, data.frame(m=m, errorTrain = 1-accTrain, errorTest = 1-accTest))
+    rbind(res, data.frame(m=m, errorTrain = 1-accTrain, errorTest = 1-accTest))
+}
+
+p1 <- ggplot(aes (x=m, y=value, colour=variable, shape=variable), data = melt (res, id="m")) + 
+    geom_line(size=1) + geom_point(size=5) +
+    xlab("Размер обучающей выборки (m)") + 
+    ylab ("Ошибка (1-Accuracy)") + ggtitle("Нейросеть (nnet)")+
+    scale_colour_discrete(name="Выборка", labels=c("Обучающая", "Тестовая")) + 
+    scale_shape_discrete(name="Выборка", labels=c("Обучающая", "Тестовая"))
+
+#Reciever Operation Curve 
+p5 <- myPlotROC (modNNET$finalModel$fitted.values, dfTrain$class, title="Нейросеть (nnet)")
+
+grid.arrange(p1,p5, nrow=2)
+
+```
+
+Модель показывает низкий разброс, т.е. не страдает от переобучения, а значит, должна показывать примерно такую же точность на новых данных, которых она еще "не видела". Собственно, именно эти качества модель продемонстрировала и именно поэтому мы ее выбрали в качестве победившей на предыдущем этапе.
+
+## Проверка модели на тестовой выборке 
+
+Качество предсказания модели на тестовых даннх, которые она не "видела" при обучении.
+
+```{r checkAccuracy, echo=FALSE, warning=FALSE, message = FALSE}
+modFinal <- modNNET #82%
+
+cm <- caret::confusionMatrix(data = predict(modFinal, newdata=dfTest), reference = dfTest$class,
+                             positive= "1")
+accFinal <- cm$overal[1]
+cm
+
+# делаем свою функцию, чтобы исправить баг библиотеки caret 6.0-41
+myPredict.train <- function (object, newdata = NULL, type = "raw", na.action = na.omit, ...) {
+    if (all(names(object) != "modelInfo")) {
+        object <- update(object, param = NULL)
+    }
+    if (!is.null(object$modelInfo$library)) 
+        for (i in object$modelInfo$library) do.call("require", 
+            list(package = i))
+    if (!(type %in% c("raw", "prob"))) 
+        stop("type must be either \"raw\" or \"prob\"")
+    if (type == "prob") {
+        if (is.null(object$modelInfo$prob)) 
+            stop("only classification models that produce probabilities are allowed")
+    }
+    if (!is.null(newdata)) {
+        if (inherits(object, "train.formula")) {
+            newdata <- as.data.frame(newdata)
+            rn <- row.names(newdata)
+            Terms <- delete.response(object$terms)
+            m <- model.frame(Terms, newdata, na.action = na.action, 
+                xlev = object$xlevels)
+            if (!is.null(cl <- attr(Terms, "dataClasses"))) 
+                .checkMFClasses(cl, m)
+            keep <- match(row.names(m), rn)
+            newdata <- model.matrix(Terms, m, contrasts = object$contrasts)
+            xint <- match("(Intercept)", colnames(newdata), nomatch = 0)
+            if (xint > 0) 
+                newdata <- newdata[, -xint, drop = FALSE]
+        }
+    }
+    else {
+        if (!is.null(object$trainingData)) {
+            newdata <- if (object$method == "pam") 
+                object$finalModel$xData
+            else object$trainingData
+        }
+        else stop("please specify data via newdata")
+    }
+    if (type == "prob") {
+        out <- extractProb(list(object), unkX = newdata, unkOnly = TRUE, 
+            ...)
+        obsLevels <- levels(object)
+        out <- out[, paste0("X", obsLevels), drop = FALSE]
+    }
+    else {
+        out <- extractPrediction(list(object), unkX = newdata, 
+            unkOnly = TRUE, ...)$pred
+    }
+    out
+}
+
+pred <- myPredict.train (modFinal, newdata = dfMOMosNormalized, type = "prob")
+thresh <- 0.10
+pred$class <- as.factor(ifelse(pred$X1>0.5+thresh, 1, ifelse(pred$X0>0.5+thresh, 0, 2)))
+pred$class2 <- dfMOMosNormalized$class3
+#View(pred)
+```
+
+Мы получили неплохую точность **`r accFinal `**, однако мы можем сделать более тонкую модель, введя пороговое значение "уверенности модели". Если с точки зрения модели вероятность того, что клиент является ВИПом больше, чем 50%+порог, то она будет считать его ВИПом, однако, если вероятность попадает в диапазон междк 50% и 50%+порог, то модель будет чествно говорить, что она не уверена. Установим порог равным **`r thresh*100`%**.
+
+```{r predictWTresh, echo=FALSE, warning=FALSE, message = FALSE, eval=TRUE}
+tab <- table (pred$class)
+tab
+
+levels (pred$class2) <- levels (pred$class)
+cm2 <- caret::confusionMatrix(data = pred$class[pred$class != 2], reference = pred$class2[pred$class != 2],
+                              positive= "1")
+cm2
+
+##False negative
+#str(pred)
+#pred %>% filter (class==0 & class2==1)
+
+```
+
+Видим, всега **`r tab[3]`** случаев, когда модель не уверена, однако, если их исключить, точность предсказания становится равной **`r cm2$overal[1]*100`%**.
+
+## Анализ некорректно отклассифицированных пользователей. Ложные не-ВИПы
+```{r predictNew, echo=FALSE, warning=FALSE, message = FALSE, eval=TRUE}
+
+#predicted <- predict (modFinal, newdata = dfMOMosNormalized)
+dfPredicted <- data.frame (uid = dfMOMosNormalized$uid, classPredicted3 = as.factor(pred$class),
+                           prob1 = pred$X1, stringsAsFactors = FALSE)
+
+#if (!exists(dfMOMos)){
+    dfMOMos <- readRDS ("../data/MaldivesMOMosClassified3.rds") 
+#}
+
+dfMOMosPred <-  dfMOMos %>% left_join(dfPredicted, by = c("uid" = "uid"))
+nCols <- ncol(dfMOMosPred)
+dfMOMosPred <- dfMOMosPred[c(1:11,nCols-1, nCols, 12:(nCols-2))]
+#View (dfMOMosPred)
+# saveRDS (dfMOMosPred, "data/MaldivesMOMosPrediction.rds")
+ #require (xlsx)
+# write.xlsx2(dfMOMosPred, "../data/MaldivesMembersMosPrediction3.xlsx", row.names = FALSE, showNA = FALSE)
+```
+
+Из последней таблицы видим, что модель неверно предсказала категорию 2-х ВИП пользователей, посчитав их не-ВИПами (False Negative Rate) и неверно отнесла 9 не-ВИПов к категории ВИП (False Positive Rate). Для нашей задачи наиболее критичной является ошибка первого типа, при которой мы "теряем" ВИП пользователей.
+
+<small>
+```{r analyseFN1, echo=FALSE, warning=FALSE, message = FALSE, results="asis"}
+zeroNA <- function (x) {
+    ifelse (is.na(x), 0, x)
+}
+
+memberLink <- function (df, uid) {
+    paste0(wwwPrefix, df$url[df$uid==uid])
+}
+
+
+dfFN <- dfMOMosPred %>% filter (class3==1 & classPredicted3==0) %>% 
+    mutate (totalReviewsCount = zeroNA(reviews1Count) + zeroNA(reviews2Count) +
+                zeroNA(reviews3Count) + zeroNA(reviews4Count) + zeroNA(reviews5Count)) %>%
+    select (uid, prob1, comment3, memberName, memberTitle, registrationYear, citiesCount, 
+            totalReviewsCount, publicationsCount) 
+#dfFN 
+
+#colnames(tab1) <- c('Курорт1', 'Курорт2', 'Вероятность', 'Стат. значима')
+print (xtable(dfFN, caption = 'Ошибочно назначенные не-ВИП' 
+              ,align="ll|clcccccc" 
+              ,digits=c(0,0,2,0,0,0,0,0,0,0)
+              ), 
+       include.rownames = FALSE
+       , type="html"
+       #,size="small"
+)
+
+
+```
+</small>
+
+ - [**[Andrey R]**](`r memberLink(dfMOMosPred, dfFN$uid[1])`). Зарегистрирован достаточно давно, но оставил очень мало отзыв и публикаций. Мы отнесли его к категории ВИП только за одно упоминание ресторана Турандот в тексте публикации. Текущая версия модели на использует информацию о содержимом публикаций, поэтому она с высокой вероятностью ~75% считает его не ВИПом.
+ 
+ - [**Ilyaz80**](`r memberLink(dfMOMosPred, dfFN$uid[2])`). Система отнесла его к категории ВИП с вероятностью 39,8%. Если бы мы использовали чуть более широкий интервал неуверенности системы (сейчас [40%, 60%]), например [35%, 65%], то система отнесла бы этого пользователя к неопределенной категории, к которой он по сути и относится судя по тексту комментария. Причина, по которой система считает его не-ВИПом, видимо, такая же, по которой и эксперт был не уверен в его ВИПовости, - недостаток и нформации о пользователе - всего 4 публикации с 2012 года. Если пользователь пассивен на сайте TripAdvisor, то мы его не сможем выделить через этот сайт, он просто сливается с серой массой. Более того, возможно, он нам и не очень инетресен, т.к. перестал ездить в дорогие путешествия. Проверить эту гипотезу мы сможем, проанализировав реакцию от пользователей на наши коммерческие предложения.
+ 
+ - [**Надежда Ц**](`r  memberLink(dfMOMosPred, dfFN$uid[3])`). Система не слишком уверенно отнесла его к категории не-ВИП, но все равно не понятно, почему, т.к. пользователь зарегистрирован не так долго по сравнению с предыдущими двумя и намного активнее по сравнению с ними. Она посещала интересные и необычные места, которые действительно, повышают ее ВИП статус, однако в отзывах иногда делает акцент на стоимость услуг, на соотношение цена/качество, например, рекомендует жестко торговаться с тук-тукерами в Шри-Ланке. Посмотрим на ее параметры более детально, на графике она отмечена красным кружком (False Negative).
+
+```{r analyseFN2, echo=FALSE, warning=FALSE, message = FALSE, eval=TRUE, fig.width=8, fig.height=6}
+
+dfPred <- dfMOMosPred %>% select (uid, prob1, classPredicted3) %>% 
+    inner_join (dfMOMosNormalized, by=c("uid"="uid")) %>% 
+    select (-starts_with("comment"), -starts_with("classInitial"), 
+            -classPredicted1, -class1, -class2) %>%
+    mutate (classType = ifelse(is.na(class3), "New", 
+            ifelse(class3==1 & classPredicted3==0, "False Negative",
+            ifelse(class3==0 & classPredicted3==1, "False Positive",
+            ifelse(class3==1, "True VIP", "True non-VIP"))))) 
+#dfPred %>% View 
+
+## Посмотрим на одного Ложного не-ВИПа
+dfFN2 <- dfPred %>% filter ((classType %in% c("True VIP", "True non-VIP","False Negative")) &
+                                !(uid %in% dfFN$uid[1:2]))
+#dfFN2 %>% View
+
+grid.arrange(
+    ggplot( data=dfFN2, aes (x=tagLuxury, y = badgeTravellersChoiceCount)) + 
+        geom_point(aes(color=classType, shape = classType), size=3, alpha=0.7)+
+        scale_colour_discrete(guide = FALSE)+
+        scale_shape_discrete(guide = FALSE),
+    ggplot( data=dfFN2, aes (x=reviews5Percent, y = category50Percent)) + 
+        geom_point(aes(color=classType, shape = classType), size=3, alpha=0.7),
+    ggplot( data=dfFN2, aes (x=citiesCount, y = badgeHotelReviewsPercent)) + 
+        geom_point(aes(color=classType, shape = classType), size=3, alpha=0.7)+
+        scale_colour_discrete(guide = FALSE)+
+        scale_shape_discrete(guide = FALSE),
+    ggplot( data=dfFN2, aes (x=badgeTotalReviewsTitle, y = userRating40Percent)) + 
+        geom_point(aes(color=classType, shape = classType), size=3, alpha=0.7)
+    ,ncol=2, widths=c(1,1.4))
+
+
+```
+
+Из графика видим, что она крепкий середнячок, этакий средний класс, который может поехать в приличное место, но будет экономить на мелочах. Эта оценка сделана экспертно в результате прочтения ее отзывов, графики ее подтверждают:
+ 
+ - У нее нет метки "Любитель роскоши", которую дает TripAdvisor.
+ - У нее довольно высокий процент отзывов, когда она дала оценку 5, при этом совсем отсутствуют отзывы о 5-ти зведных отелях.
+ - Она посетила несколько городов, но не так много, как большая часть ВИП пользователей.
+ - Значительная часть ее отзывов (~50%) дана о местах, которые пользователи оценивают в 4 звезды. 
+
+## Анализ некорректно отклассифицированных пользователей. Ложные ВИПы
+
+Рассмотрим пользователей, которых модель ошибочно отнесла к категории ВИП (False Positive).
+
+<small>
+```{r analyseFP1, echo=FALSE, warning=FALSE, message = FALSE, results='asis'}
+
+dfFP <- dfMOMosPred %>% filter (class3==0 & classPredicted3==1) %>% 
+    mutate (totalReviewsCount = zeroNA(reviews1Count) + zeroNA(reviews2Count) +
+                zeroNA(reviews3Count) + zeroNA(reviews4Count) + zeroNA(reviews5Count)) %>%
+    select (uid, prob1, comment3, memberName, memberTitle, registrationYear, citiesCount, 
+            totalReviewsCount, publicationsCount) %>% 
+    arrange (uid)
+
+print (xtable(dfFP, caption = 'Ошибочно назначенные ВИП. Часть 1' 
+              ,align="ll|clcccccc" 
+              ,digits=c(0,0,2,0,0,0,0,0,0,0)
+              ), 
+       include.rownames = FALSE
+       , type="html"
+       #,size="small"
+)
+ 
+
+tab3 <- dfPred %>% inner_join(dfFP, by=c("uid"="uid")) %>%
+    arrange (uid) %>%
+    select (memberName, tagLuxury, badgeTravellersChoiceCount, reviews5Percent,
+            category50Percent,badgeHotelReviewsPercent, badgeTotalReviewsTitle,
+            userRating40Percent)
+
+print (xtable(tab3, caption = 'Ошибочно назначенные ВИП. Часть 2' 
+              ,align="ll|ccccccc" 
+              ,digits=c(0,0,0,3,3,3,3,2,3)
+              ), 
+       include.rownames = FALSE
+       , type="html"
+       #,size="small"
+)
+
+```
+</small>
+
+ - [**Frederic V**](`r memberLink(dfMOMosPred, dfFP$uid[1])`). По отзывам и посещенным местам является ВИПом. При экспертной классификации не был отнесен к ВИП категории, поскольку является иностранцем, живущим в Москве, т.е. не инетресен как потенциальный клиент. Чтобы научить модель отсеивать таких пользователей, нужно, чтобы их было достаточно много в обучающей выборке, а он у нас такой один. Формально, модель отнесла его в ВИПам вполне корректно.
+ 
+ - [**Cubertox**](`r memberLink(dfMOMosPred, dfFP$uid[2])`). Явно не ВИП пользователь. Модель ошиблась, видимо, из-за того, что у него из 6 отзывов все 6 об отелях, что привело к максимальному значению важного показателя badgeHotelReviewsPercent. Ошибки такого типа будут присутствовать в модели, поскольку диапазоны значений параметров пользователей для разных классов. Полностью уйти от этой полчится, если удастся найти или придумать такой параметр. который бучет четко разделять два класса пользователей, что маловероятно. Улучшить ситуацию можно, увеличив обучающую выборку для модели. Если немного расширить границы интервала неуверенности системы, например до [35%, 65%], то этот пользователь уйдет в категорию "не понятно".
+ 
+ - [**Marisha_n1**](`r memberLink(dfMOMosPred, dfFP$uid[3])`). Имеет метку "Любитель роскоши", т.е. TripAdvisor тоже счел ее ВИПом. Судя по текстам отзывов, это молодая женщина, которая начинала путешествовать еще с родителями, и побывала в большом количестве мест, оставила много отзывов и была в целом активна на сайте. Возможно, модель работала бы точнее, если бы у всех пользователей была проставлена возрастная группа, тогда можно было бы делать поправку на возраст.
+ 
+ - [**Anton_Moscow_Russia**](`r memberLink(dfMOMosPred, dfFP$uid[4])`).  Имеет метку "Любитель роскоши" и мне он кажется вполне ВИПом.
+ 
+ - [**Ekaterina S**](`r memberLink(dfMOMosPred, dfFP$uid[5])`). Имеет метку "Любитель роскоши". Бывает как в дорогих пафосных местах, так и в дешевых типа Стардогс! или KFC, причем иногда ставит дешевым местам высокие оценки. Посетила большое количество мест, причем не дешевых. По большому счету, она, наверное, относится к среднему классу, возможно, к бизнес-классу. Понизить ее оценку системой можно, назначив признак "неВИП" дешевым пунктам питания. А с другой стороны, ничего плохого не будет, если ей будет предложено воспользоваться услугами ВИП турагенства, ведь есть вероятность, что её муж является ВИПом, поэтому она ездит в престижные места, а в Москве питается в общепите.
+ 
+ - [**MrLegus**](`r memberLink(dfMOMosPred, dfFP$uid[6])`). Несколько молод для ВИП категории (25-34), ездит в основном в Азию, но селится в 5-ти звездных отелях, отзывы пишет на английском языке. Совсем бомжом его не назовешь, но он не ВИП. По всей видимости, он попал в категорию ВИП из-за того, что пишет очень много отзывов обо всем подряд и в результате показатели типа "доля отзывов о низкозвездных местах" у него получились низкими из-за большого знаменателя, что и ввело модель в заблуждение. Таких нестандартных пользователей относительно мало, а если бы их было много, то модель лучше бы их учитывала. Если немного расширить границы интервала неуверенности системы, например до [35%, 65%], то этот пользователь уйдет в категорию "не понятно".
+ 
+ - [**yankabout**](`r memberLink(dfMOMosPred, dfFP$uid[7])`). Имеет противоречивые метки "Любитель роскоши" и "Любитель экономного отдыха", что означает, что tripAdvisor тоже не смог его однозначно отклассифицировать. Посетил много стран на разных контенетах, останавливается в 5-ти звездных гостиницах, в Москве ходит по дорогим местам типа Пушкинъ, причем не всегда доволен, отзывы пишет на английском языке. Очень похож на ВИПа.
+ 
+ - [**Daria_Samkovich**](`r memberLink(dfMOMosPred, dfFP$uid[8])`). Имеет метки "Гурман", "Любитель роскоши", "Любитель делать покупки". Отзывов и публикаций имеет не много, хотя посетила много городов. Цитата из отзыва "*Нарочито дорогое меню, цена-качество не соответствуют. Не люблю места, где нет души ни у повара, ни у официантов, которые работают лишь для того, чтобы содрать с клиента больше денег. Для меня характерный показатель бутылка аква панна за 10 евро, хотя могу позволить себе любые цены.*". Пожалуй, можно отнести к ВИП и включить в список рассылки.
+ 
+ - [**EPATR**](`r memberLink(dfMOMosPred, dfFP$uid[9])`). Имеет метку "Любитель роскоши", 6 раз был на Мальдивах. Имеет мало отзывов и все о 5-ти звездном отеле, поэтому был отнесен моделью к категории ВИП. На основе одного имеющегося отзыва очень похож на ВИПа.
+
+
+```{r stopCluster, echo=FALSE, warning=FALSE, message = FALSE, cache=FALSE}
+stopCluster(cl) # Explicitly free up cores again.
+
+```
