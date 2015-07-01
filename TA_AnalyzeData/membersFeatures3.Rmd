@@ -10,7 +10,7 @@ output: html_document
 ## Формирование таблицы параметров пользователя
 
 ```{r init, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
-#eval(parse('C:/Work/R_Sentiment/textFunctions.R',encoding = "UTF-8"))
+eval(parse('common.R',encoding = "UTF-8"))
 #install.packages("tidyr")
 #install.packages("gridExtra")
 
@@ -39,15 +39,19 @@ dfPlacesReviews <- readRDS ("../data/PlacesReviews.rds")
 На основе данных об отзывах пользователя о месте (MembersCityPage) посчитаем следующие параметры:
 
  - **VIPBalanceCount** - разница между количеством посещенных VIP и не-VIP мест. Нормализуем с помощью гиперболического тангенса.
- 
-Нормализация гиперболическим тангенсом дает нам значения в диапазоне (-1,1), сохраняя 0, т.е. если изначально значение было равно 0, то после нормализации оно также будет равно 0. Также "растягиваем" шкалу нормализации таким образом, чтобы значения **VIPBalanceCount** с диапазоне [0;10] растягивались приблизительно в диапазон [0,0.9], т.е. были хорошо отличимы между собой, а значения более 10 "схлопывались"в районе +1.
- 
+
+```{r explainTanh, echo=FALSE, warning=FALSE, message = FALSE, fig.height=3}
+x <- -10:60
+tmp <- data.frame (x, y = tanh(x/2), alpha = 2)
+tmp <- rbind (tmp, data.frame (x, y = tanh(x/6), alpha = 6))
+tmp <- rbind (tmp, data.frame (x, y = tanh(x/10), alpha = 10))
+tmp <- rbind (tmp, data.frame (x, y = tanh(x/20), alpha = 20))
+qplot(x, y, data=tmp, colour=as.factor(alpha) ,geom="line")
+```
+
+Нормализация гиперболическим тангенсом дает нам значения в диапазоне (-1,1), сохраняя 0, т.е. если изначально значение было равно 0, то после нормализации оно также будет равно 0. 
+
 ```{r addPlacesFeatures, echo=FALSE, warning=FALSE, message = FALSE}
-x <- -30:30
-qplot(x,tanh(x/6), geom="line")
-
-#View(dfMembersCP) #MembersCityPage
-
 dfCPCount <-     dfMembersCP %>% select (uid, placeID, reviewID) %>%
     filter (!is.na(placeID)) %>% # отсеиваем отзывы о городах (не конкретных местах)
     left_join (dfPlaces, by = c("placeID"="placeID")) %>% 
@@ -55,10 +59,27 @@ dfCPCount <-     dfMembersCP %>% select (uid, placeID, reviewID) %>%
     summarize(VIPPlacesCount = sum(isVIP), nonVIPPlacesCount = sum(isNonVIP)) %>% 
     mutate (VIPPlacesCount = ifelse(is.na(VIPPlacesCount), 0, VIPPlacesCount),
             nonVIPPlacesCount = ifelse(is.na(nonVIPPlacesCount), 0, nonVIPPlacesCount),
-            VIPBalanceCount = tanh((VIPPlacesCount-nonVIPPlacesCount)/6)) %>%
+            VIPBalanceCount = (VIPPlacesCount-nonVIPPlacesCount)) %>%
     select (uid, VIPBalanceCount)
+
+## хотим, чтобы медиана переменной после нормализации была = 0,5
+#mean (dfCPCount$VIPBalanceCount)
+beforeNorm <- dfCPCount$VIPBalanceCount
+dfCPCount$VIPBalanceCount <- normalizeTanh(beforeNorm, mode="mean")
+#median (dfCPCount$VIPBalanceCount)
 #View(dfCPCount)
+    
+p1 <- qplot (x="До нормализации", y = beforeNorm) +
+    geom_boxplot(outlier.colour = "salmon", outlier.size = 5) + 
+    geom_jitter(colour="blue", alpha=0.3) +
+    ylab ("VIPBalanceCount")
+p2 <- ggplot(dfCPCount, aes(x="После нормализации",y = VIPBalanceCount)) + 
+    geom_boxplot(outlier.colour = "salmon", outlier.size = 5) + 
+    geom_jitter(colour="blue", alpha=0.3)
+grid.arrange(p1, p2, ncol=2)
 ```
+
+Также "растягиваем" шкалу нормализации таким образом, чтобы среднее значений **VIPBalanceCount**, равной **`r mean(beforeNorm)`**, после нормализации была равна 0,5. Тогда значения, близкие к среднему будут хорошо различимы между собой, а высокие значения "схлопнутся" в районе +1. См. график ниже.
 
 Добавим параметры, вычисленные на основе отзывов о местах:
 
@@ -98,7 +119,7 @@ dfTmp2 <-    dfTmp %>% select (uid, category) %>%
     group_by(uid, category) %>%
     summarize(categoryCount=n()) %>% 
     ungroup() %>% 
-    mutate (categoryCountNorm = tanh(categoryCount/18)) %>% 
+    mutate (categoryCountNorm = normalizeTanh(categoryCount, mode="mean")) %>% 
     select (-categoryCount) %>% #чтобы не увеличивать число параметров
     mutate (category = ifelse(is.na(category),"category00",
                               paste0("category", category))) %>% 
@@ -127,7 +148,7 @@ dfTmp4 <-    dfTmp %>% select (uid, userRating) %>%
     group_by(uid, userRating) %>%
     summarize(userRatingCount=n()) %>% 
     ungroup() %>% 
-    mutate (userRatingNorm = tanh(userRatingCount/18)) %>% 
+    mutate (userRatingNorm = normalizeTanh(userRatingCount, mode="mean")) %>% 
     select (-userRatingCount) %>% #чтобы не увеличивать число параметров
     mutate (userRating = ifelse(is.na(userRating),"userRating00",
                               paste0("userRating", userRating))) %>% 
